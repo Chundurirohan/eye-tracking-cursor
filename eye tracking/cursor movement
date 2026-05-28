@@ -1,0 +1,610 @@
+import argparse
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import pyautogui
+import torch
+from l2cs import Pipeline
+
+
+# ----------------------------
+# Config / Data Structures
+# ----------------------------
+
+
+@dataclass
+class AppConfig:
+    camera_index: int = 0
+    frame_width: int = 640
+    frame_height: int = 480
+    calibrate: bool = False
+    calibration_path: str = "calibration.json"
+    model_path: str = "models/L2CSNet/Gaze360/L2CSNet_gaze360.pkl"
+    arch: str = "ResNet50"
+    dwell_radius_px: float = 40.0
+    dwell_time_s: float = 0.55
+    click_cooldown_s: float = 0.40
+    blink_ear_threshold: float = 0.20
+    blink_min_duration_s: float = 0.08
+    double_blink_window_s: float = 0.55
+    blink_mode: bool = True
+    dwell_mode: bool = True
+    show_debug: bool = True
+    smooth_measurement_sigma_px: float = 22.0
+    smooth_process_pos_sigma: float = 2.0
+    smooth_process_vel_sigma: float = 30.0
+    move_every_n_frames: int = 1
+
+
+@dataclass
+class CalibrationModel:
+    order: int
+    coeff_x: np.ndarray
+    coeff_y: np.ndarray
+    screen_w: int
+    screen_h: int
+    rms_error_px: float
+
+
+# ----------------------------
+# Math / Filtering
+# ----------------------------
+
+
+def feature_vec(yaw: float, pitch: float, order: int = 2) -> np.ndarray:
+    y = yaw
+    p = pitch
+    if order == 2:
+        return np.array([1.0, y, p, y * y, y * p, p * p], dtype=np.float64)
+    # order == 3
+    return np.array(
+        [
+            1.0,
+            y,
+            p,
+            y * y,
+            y * p,
+            p * p,
+            y * y * y,
+            (y * y) * p,
+            y * (p * p),
+            p * p * p,
+        ],
+        dtype=np.float64,
+    )
+
+
+def fit_poly_mapping(
+    gaze_samples: List[Tuple[float, float]],
+    screen_samples: List[Tuple[float, float]],
+    order: int,
+    ridge_lambda: float = 1e-4,
+) -> CalibrationModel:
+    X = np.stack([feature_vec(y, p, order) for y, p in gaze_samples], axis=0)
+    sx = np.array([s[0] for s in screen_samples], dtype=np.float64)
+    sy = np.array([s[1] for s in screen_samples], dtype=np.float64)
+
+    # Ridge regression for stability
+    I = np.eye(X.shape[1], dtype=np.float64)
+    XtX = X.T @ X + ridge_lambda * I
+    coeff_x = np.linalg.solve(XtX, X.T @ sx)
+    coeff_y = np.linalg.solve(XtX, X.T @ sy)
+
+    pred_x = X @ coeff_x
+    pred_y = X @ coeff_y
+    err = np.sqrt((pred_x - sx) ** 2 + (pred_y - sy) ** 2)
+    rms = float(np.sqrt(np.mean(err**2)))
+
+    screen_w, screen_h = pyautogui.size()
+    return CalibrationModel(
+        order=order,
+        coeff_x=coeff_x,
+        coeff_y=coeff_y,
+        screen_w=screen_w,
+        screen_h=screen_h,
+        rms_error_px=rms,
+    )
+
+
+def map_gaze_to_screen(yaw: float, pitch: float, model: CalibrationModel) -> Tuple[float, float]:
+    phi = feature_vec(yaw, pitch, model.order)
+    x = float(phi @ model.coeff_x)
+    y = float(phi @ model.coeff_y)
+    x = float(np.clip(x, 0, model.screen_w - 1))
+    y = float(np.clip(y, 0, model.screen_h - 1))
+    return x, y
+
+
+class Kalman2D:
+    def __init__(self, meas_sigma: float, proc_pos_sigma: float, proc_vel_sigma: float):
+        self.x = np.zeros((4, 1), dtype=np.float64)  # [x, y, vx, vy]
+        self.P = np.eye(4, dtype=np.float64) * 500.0
+        self.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float64)
+        self.R = np.eye(2, dtype=np.float64) * (meas_sigma**2)
+        self.proc_pos_sigma = proc_pos_sigma
+        self.proc_vel_sigma = proc_vel_sigma
+        self.initialized = False
+
+    def update(self, z_x: float, z_y: float, dt: float) -> Tuple[float, float]:
+        dt = max(dt, 1e-3)
+        F = np.array(
+            [[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]],
+            dtype=np.float64,
+        )
+        Q = np.diag(
+            [
+                self.proc_pos_sigma**2,
+                self.proc_pos_sigma**2,
+                self.proc_vel_sigma**2,
+                self.proc_vel_sigma**2,
+            ]
+        ).astype(np.float64)
+
+        if not self.initialized:
+            self.x[0, 0] = z_x
+            self.x[1, 0] = z_y
+            self.initialized = True
+            return z_x, z_y
+
+        # Predict
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+
+        # Correct
+        z = np.array([[z_x], [z_y]], dtype=np.float64)
+        y = z - (self.H @ self.x)
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+        return float(self.x[0, 0]), float(self.x[1, 0])
+
+    def velocity_mag(self) -> float:
+        return float(np.sqrt(self.x[2, 0] ** 2 + self.x[3, 0] ** 2))
+
+
+# ----------------------------
+# Blink / Dwell Click
+# ----------------------------
+
+
+class DwellClicker:
+    def __init__(self, radius_px: float, dwell_s: float, cooldown_s: float):
+        self.radius_px = radius_px
+        self.dwell_s = dwell_s
+        self.cooldown_s = cooldown_s
+        self.anchor: Optional[Tuple[float, float]] = None
+        self.anchor_t = 0.0
+        self.last_click_t = -1e9
+
+    def update(self, x: float, y: float, now: float) -> bool:
+        if now - self.last_click_t < self.cooldown_s:
+            self.anchor = (x, y)
+            self.anchor_t = now
+            return False
+
+        if self.anchor is None:
+            self.anchor = (x, y)
+            self.anchor_t = now
+            return False
+
+        dist = np.hypot(x - self.anchor[0], y - self.anchor[1])
+        if dist > self.radius_px:
+            self.anchor = (x, y)
+            self.anchor_t = now
+            return False
+
+        if now - self.anchor_t >= self.dwell_s:
+            self.last_click_t = now
+            self.anchor = (x, y)
+            self.anchor_t = now
+            return True
+        return False
+
+
+class BlinkClicker:
+    def __init__(
+        self,
+        ear_threshold: float,
+        min_duration_s: float,
+        double_window_s: float,
+        cooldown_s: float,
+    ):
+        self.ear_threshold = ear_threshold
+        self.min_duration_s = min_duration_s
+        self.double_window_s = double_window_s
+        self.cooldown_s = cooldown_s
+        self.in_blink = False
+        self.blink_start_t = 0.0
+        self.recent_blinks: List[float] = []
+        self.last_click_t = -1e9
+
+    def update(self, ear: float, now: float, confidence_ok: bool, stable_gaze: bool) -> bool:
+        if not confidence_ok or not stable_gaze:
+            self.in_blink = False
+            return False
+
+        if ear < self.ear_threshold:
+            if not self.in_blink:
+                self.in_blink = True
+                self.blink_start_t = now
+            return False
+
+        if self.in_blink:
+            self.in_blink = False
+            duration = now - self.blink_start_t
+            if duration >= self.min_duration_s:
+                self.recent_blinks.append(now)
+                self.recent_blinks = [t for t in self.recent_blinks if now - t <= self.double_window_s]
+                if (
+                    len(self.recent_blinks) >= 2
+                    and now - self.last_click_t >= self.cooldown_s
+                ):
+                    self.last_click_t = now
+                    self.recent_blinks.clear()
+                    return True
+        return False
+
+
+# ----------------------------
+# Eye Aspect Ratio (EAR)
+# ----------------------------
+
+
+def euclidean(p1: np.ndarray, p2: np.ndarray) -> float:
+    return float(np.linalg.norm(p1 - p2))
+
+
+def eye_aspect_ratio(pts: np.ndarray) -> float:
+    # 6 points expected: [p1..p6]
+    # EAR = (|p2-p6| + |p3-p5|) / (2*|p1-p4|)
+    if pts.shape[0] < 6:
+        return 1.0
+    a = euclidean(pts[1], pts[5])
+    b = euclidean(pts[2], pts[4])
+    c = euclidean(pts[0], pts[3]) + 1e-6
+    return (a + b) / (2.0 * c)
+
+
+# MediaPipe FaceMesh landmark IDs for EAR approximation
+LEFT_EYE_IDS = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_IDS = [362, 385, 387, 263, 373, 380]
+
+
+def extract_eye_points(face_landmarks, w: int, h: int, eye_ids: List[int]) -> np.ndarray:
+    pts = []
+    for idx in eye_ids:
+        lm = face_landmarks.landmark[idx]
+        pts.append([lm.x * w, lm.y * h])
+    return np.array(pts, dtype=np.float32)
+
+
+# ----------------------------
+# Calibration UI
+# ----------------------------
+
+
+def calibration_points(screen_w: int, screen_h: int) -> List[Tuple[int, int]]:
+    xs = [int(screen_w * 0.1), int(screen_w * 0.5), int(screen_w * 0.9)]
+    ys = [int(screen_h * 0.1), int(screen_h * 0.5), int(screen_h * 0.9)]
+    return [(x, y) for y in ys for x in xs]
+
+
+def show_calibration_target(screen_w: int, screen_h: int, point: Tuple[int, int], idx: int, total: int) -> np.ndarray:
+    canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+    x, y = point
+    cv2.circle(canvas, (x, y), 24, (0, 255, 255), -1)
+    cv2.circle(canvas, (x, y), 42, (255, 255, 255), 2)
+    cv2.putText(canvas, f"Point {idx+1}/{total}", (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    cv2.putText(
+        canvas,
+        "Look at the dot, press SPACE to sample. ESC to cancel.",
+        (40, 105),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (220, 220, 220),
+        2,
+    )
+    return canvas
+
+
+def run_calibration(
+    cap: cv2.VideoCapture,
+    gaze_pipeline: Pipeline,
+    config: AppConfig,
+) -> Optional[CalibrationModel]:
+    screen_w, screen_h = pyautogui.size()
+    pts = calibration_points(screen_w, screen_h)
+    gaze_samples: List[Tuple[float, float]] = []
+    screen_samples: List[Tuple[float, float]] = []
+    win = "Eye Cursor Calibration"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    for i, pt in enumerate(pts):
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            overlay = show_calibration_target(screen_w, screen_h, pt, i, len(pts))
+            cv2.imshow(win, overlay)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                cv2.destroyWindow(win)
+                return None
+            if key == 32:
+                # Take a short burst and median for robustness
+                ys = []
+                ps = []
+                for _ in range(8):
+                    ok2, f2 = cap.read()
+                    if not ok2:
+                        continue
+                    try:
+                        res = gaze_pipeline.step(f2)
+                    except Exception:
+                        continue
+                    if len(res.yaw) > 0 and len(res.pitch) > 0:
+                        ys.append(float(res.yaw[0]))
+                        ps.append(float(res.pitch[0]))
+                    time.sleep(0.01)
+                if len(ys) >= 3:
+                    gaze_samples.append((float(np.median(ys)), float(np.median(ps))))
+                    screen_samples.append((float(pt[0]), float(pt[1])))
+                    break
+
+    cv2.destroyWindow(win)
+    if len(gaze_samples) < 6:
+        return None
+
+    # Try order 2 first, then order 3 if error > 40px
+    model2 = fit_poly_mapping(gaze_samples, screen_samples, order=2)
+    if model2.rms_error_px <= 40.0:
+        return model2
+    model3 = fit_poly_mapping(gaze_samples, screen_samples, order=3)
+    return model3 if model3.rms_error_px < model2.rms_error_px else model2
+
+
+def save_calibration(model: CalibrationModel, path: str) -> None:
+    data = {
+        "order": model.order,
+        "coeff_x": model.coeff_x.tolist(),
+        "coeff_y": model.coeff_y.tolist(),
+        "screen_w": model.screen_w,
+        "screen_h": model.screen_h,
+        "rms_error_px": model.rms_error_px,
+    }
+    Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def load_calibration(path: str) -> Optional[CalibrationModel]:
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return CalibrationModel(
+            order=int(data["order"]),
+            coeff_x=np.array(data["coeff_x"], dtype=np.float64),
+            coeff_y=np.array(data["coeff_y"], dtype=np.float64),
+            screen_w=int(data["screen_w"]),
+            screen_h=int(data["screen_h"]),
+            rms_error_px=float(data.get("rms_error_px", 999.0)),
+        )
+    except Exception:
+        return None
+
+
+# ----------------------------
+# Main Runtime
+# ----------------------------
+
+
+def make_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser("eye_cursor")
+    p.add_argument("--camera-index", type=int, default=0)
+    p.add_argument("--model-path", type=str, default="models/L2CSNet/Gaze360/L2CSNet_gaze360.pkl")
+    p.add_argument("--calibration-path", type=str, default="calibration.json")
+    p.add_argument("--calibrate", action="store_true")
+    p.add_argument("--no-dwell", action="store_true")
+    p.add_argument("--no-blink", action="store_true")
+    p.add_argument("--debug", action="store_true")
+    return p
+
+
+def main() -> None:
+    args = make_parser().parse_args()
+
+    config = AppConfig(
+        camera_index=args.camera_index,
+        calibration_path=args.calibration_path,
+        model_path=args.model_path,
+        calibrate=args.calibrate,
+        dwell_mode=not args.no_dwell,
+        blink_mode=not args.no_blink,
+        show_debug=args.debug,
+    )
+
+    pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0.0
+
+    cap = cv2.VideoCapture(config.camera_index)
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open camera. Check permissions and camera index.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.frame_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.frame_height)
+
+    model_path = Path(config.model_path)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model weights not found: {model_path}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    gaze_pipeline = Pipeline(weights=model_path, arch=config.arch, device=device)
+
+    calibration = None if config.calibrate else load_calibration(config.calibration_path)
+    if calibration is None:
+        print("Running 9-point calibration...")
+        calibration = run_calibration(cap, gaze_pipeline, config)
+        if calibration is None:
+            cap.release()
+            cv2.destroyAllWindows()
+            raise RuntimeError("Calibration failed or canceled.")
+        save_calibration(calibration, config.calibration_path)
+        print(f"Calibration saved. RMS error: {calibration.rms_error_px:.2f}px")
+
+    # Force recalibration if screen changed
+    current_w, current_h = pyautogui.size()
+    if calibration.screen_w != current_w or calibration.screen_h != current_h:
+        print("Screen resolution changed. Re-running calibration...")
+        calibration = run_calibration(cap, gaze_pipeline, config)
+        if calibration is None:
+            cap.release()
+            cv2.destroyAllWindows()
+            raise RuntimeError("Calibration failed.")
+        save_calibration(calibration, config.calibration_path)
+
+    kalman = Kalman2D(
+        meas_sigma=config.smooth_measurement_sigma_px,
+        proc_pos_sigma=config.smooth_process_pos_sigma,
+        proc_vel_sigma=config.smooth_process_vel_sigma,
+    )
+    dwell_clicker = DwellClicker(config.dwell_radius_px, config.dwell_time_s, config.click_cooldown_s)
+    blink_clicker = BlinkClicker(
+        ear_threshold=config.blink_ear_threshold,
+        min_duration_s=config.blink_min_duration_s,
+        double_window_s=config.double_blink_window_s,
+        cooldown_s=config.click_cooldown_s,
+    )
+
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
+    t_prev = time.monotonic()
+    fps_hist = []
+    frame_i = 0
+    win = "Eye Cursor Debug"
+
+    while True:
+        loop_start = time.monotonic()
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        h, w = frame.shape[:2]
+
+        # Face landmarks for confidence + blink EAR
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        fm_res = face_mesh.process(rgb)
+        face_ok = fm_res.multi_face_landmarks is not None and len(fm_res.multi_face_landmarks) > 0
+
+        # Gaze estimate
+        yaw = pitch = None
+        try:
+            g = gaze_pipeline.step(frame)
+            if len(g.yaw) > 0 and len(g.pitch) > 0:
+                yaw = float(g.yaw[0])
+                pitch = float(g.pitch[0])
+        except Exception:
+            yaw = pitch = None
+
+        now = time.monotonic()
+        dt = now - t_prev
+        t_prev = now
+
+        click_fired = False
+        raw_x = raw_y = smooth_x = smooth_y = None
+        ear = 1.0
+
+        # Safe failure mode: freeze updates/clicks if face tracking or gaze is bad
+        if face_ok and yaw is not None and pitch is not None:
+            raw_x, raw_y = map_gaze_to_screen(yaw, pitch, calibration)
+            smooth_x, smooth_y = kalman.update(raw_x, raw_y, dt)
+
+            if frame_i % max(config.move_every_n_frames, 1) == 0:
+                pyautogui.moveTo(int(smooth_x), int(smooth_y), duration=0)
+
+            if config.dwell_mode:
+                if dwell_clicker.update(smooth_x, smooth_y, now):
+                    pyautogui.click()
+                    click_fired = True
+
+            if config.blink_mode and fm_res.multi_face_landmarks:
+                lm = fm_res.multi_face_landmarks[0]
+                left_pts = extract_eye_points(lm, w, h, LEFT_EYE_IDS)
+                right_pts = extract_eye_points(lm, w, h, RIGHT_EYE_IDS)
+                ear_l = eye_aspect_ratio(left_pts)
+                ear_r = eye_aspect_ratio(right_pts)
+                ear = (ear_l + ear_r) / 2.0
+                stable_gaze = kalman.velocity_mag() < 2800.0
+                if blink_clicker.update(ear, now, confidence_ok=True, stable_gaze=stable_gaze):
+                    pyautogui.click()
+                    click_fired = True
+
+        # Debug / telemetry
+        elapsed = time.monotonic() - loop_start
+        fps = 1.0 / max(elapsed, 1e-6)
+        fps_hist.append(fps)
+        if len(fps_hist) > 50:
+            fps_hist.pop(0)
+        fps_avg = float(np.mean(fps_hist))
+
+        if config.show_debug:
+            dbg = frame.copy()
+            if raw_x is not None and raw_y is not None:
+                cv2.putText(
+                    dbg,
+                    f"yaw={yaw:.2f} pitch={pitch:.2f}",
+                    (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+                cv2.putText(
+                    dbg,
+                    f"EAR={ear:.3f}",
+                    (10, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 0),
+                    2,
+                )
+                cv2.putText(
+                    dbg,
+                    f"FPS={fps_avg:.1f}",
+                    (10, 72),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+                if click_fired:
+                    cv2.putText(dbg, "CLICK", (10, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            cv2.imshow(win, dbg)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord("q"):
+                break
+        else:
+            if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                break
+
+        frame_i += 1
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
