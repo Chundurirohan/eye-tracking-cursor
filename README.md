@@ -36,6 +36,21 @@ docs/                               # Architectural and user documentation
 To set up the development environment, run:
 
 ```bash
+python3 -m venv .venv
+```
+
+then, depending on your OS, run the corresponding commands:
+    Windows:
+    ```bash
+    .venv/Scripts/activate
+    ```
+    Linux/macOS:
+    ```bash
+    source .venv/bin/activate
+    ```
+
+then, once the virtual environment is active, run:
+```bash
 pip install -r requirements.txt
 ```
 
