@@ -1,0 +1,6 @@
+numpy>=1.22.0
+opencv-python>=4.5.5.64
+pytest>=7.0.0
+mypy>=1.0.0
+black>=22.0.0
+isort>=5.10.0
