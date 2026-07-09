@@ -1,0 +1,42 @@
+@import "./tokens.css";
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* Widget mode: after calibration the app is a transparent always-on-top overlay
+   (a floating widget), not an opaque window. The desktop shows through; only the
+   camera feed, control bar, confidence bar, and gaze cursor are painted. */
+body.widget, body.widget #root { background: transparent !important; }
+
+h1, h2, h3 { font-family: var(--font-display); font-weight: 600; letter-spacing: -0.02em; margin: 0; }
+button { font-family: inherit; cursor: default; border: none; background: none; color: inherit; }
+
+.glass {
+  background: var(--bg-glass);
+  -webkit-backdrop-filter: saturate(180%) blur(30px);
+  backdrop-filter: saturate(180%) blur(30px);
+  border: 1px solid var(--stroke);
+  box-shadow: var(--shadow-soft);
+}
+
+.dim { color: var(--text-2); }
+.mono { font-variant-numeric: tabular-nums; }
+
+.fade-enter { animation: fade var(--dur-med) var(--ease-soft); }
+@keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* Dwell-click confirmation ripple. */
+@keyframes gaze-ripple {
+  from { transform: translate(-50%, -50%) scale(0.35); opacity: 0.85; }
+  to   { transform: translate(-50%, -50%) scale(2.6);  opacity: 0; }
+}
