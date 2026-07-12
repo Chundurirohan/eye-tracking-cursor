@@ -13,7 +13,8 @@ import { LandmarkOverlay } from "@/features/diagnostics/LandmarkOverlay";
 import { ConfidenceMeter } from "@/features/shared/ConfidenceMeter";
 import { Toggle } from "@/features/shared/Toggle";
 import { useHotkeys } from "@/features/shared/useHotkeys";
-import { setClickThrough, nativeClick } from "@/core/system/nativeInput";
+import { setClickThrough, nativeClick, dispatchAction, isTrusted } from "@/core/system/nativeInput";
+import { RadialMenu } from "@/features/tracking/RadialMenu";
 import { listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/store/settings";
 import { QUALITY_THRESHOLD } from "@/core/session/machine";
@@ -35,6 +36,11 @@ function Inner() {
   // Gaze control of the OS cursor. Armed by default post-calibration (cursor is
   // joined to the gaze); ⌃⌥Space disarms → all control to mouse/trackpad, no fight.
   const [armed, setArmed] = useState(true);
+  // Radial action menu: the normalized gaze point where it's anchored, or null.
+  const [actionMenu, setActionMenu] = useState<{ nx: number; ny: number } | null>(null);
+  // Effective Accessibility permission (null = unknown yet). Synthetic clicks
+  // no-op when false — this is the definitive shield-vs-permission diagnostic.
+  const [axTrusted, setAxTrusted] = useState<boolean | null>(null);
   // A "Ready to calibrate" gate the user must press before calibration starts.
   const [calibReady, setCalibReady] = useState(false);
   const calibAttemptsRef = useRef(0);
@@ -180,11 +186,22 @@ function Inner() {
 
   // In widget mode let mouse input pass THROUGH the overlay so the computer is
   // usable normally; capture it during setup/calibration so buttons are clickable.
-  // Re-assert shortly after in case the window wasn't ready on the first call.
+  // A transparent overlay that ISN'T click-through silently captures every click
+  // and "freezes" the desktop — so in widget mode we re-assert click-through on a
+  // steady interval, and re-assert whenever the window regains focus, so it can
+  // never get stuck in the blocking state.
   useEffect(() => {
     void setClickThrough(widgetMode);
     const t = window.setTimeout(() => void setClickThrough(widgetMode), 300);
-    return () => window.clearTimeout(t);
+    if (!widgetMode) return () => window.clearTimeout(t);
+    const iv = window.setInterval(() => void setClickThrough(true), 1000);
+    const onFocus = () => void setClickThrough(true);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearTimeout(t);
+      window.clearInterval(iv);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [widgetMode]);
 
   // Require a "Ready" press before each calibration run.
@@ -194,6 +211,31 @@ function Inner() {
   useEffect(() => {
     const un = listen("gaze:toggle-armed", () => setArmed((a) => !a));
     return () => { void un.then((f) => f()); };
+  }, []);
+
+  // ⌃⌥P (global shortcut) pauses/resumes — a keyboard escape that always works
+  // even if the control bar can't be reached.
+  useEffect(() => {
+    const un = listen("gaze:toggle-pause", () =>
+      send({ type: stateRef.current === "paused" ? "RESUME" : "PAUSE" }));
+    return () => { void un.then((f) => f()); };
+  }, [send]);
+
+  // Auto-dismiss the radial action menu if it's left untouched for a few seconds.
+  useEffect(() => {
+    if (!actionMenu) return;
+    const t = window.setTimeout(() => setActionMenu(null), 5000);
+    return () => window.clearTimeout(t);
+  }, [actionMenu]);
+
+  // Poll effective Accessibility permission so we can SEE whether synthetic
+  // clicks can land, instead of guessing (shield vs permission).
+  useEffect(() => {
+    let alive = true;
+    const check = () => { void isTrusted().then((t) => { if (alive) setAxTrusted(t); }); };
+    check();
+    const iv = window.setInterval(check, 2000);
+    return () => { alive = false; window.clearInterval(iv); };
   }, []);
 
   useEffect(() => () => {
@@ -216,7 +258,23 @@ function Inner() {
     <div style={{ position: "absolute", inset: 0, background: isWidget ? "transparent" : "var(--bg)" }}>
       {isWidget && (
         <DwellCursor active={isWidget} armed={armed && state === "tracking"}
-          confidence={trackConf} onNativeClick={nativeClick} />
+          confidence={trackConf} onNativeClick={nativeClick}
+          menuOpen={!!actionMenu}
+          onRequestMenu={(nx, ny) => setActionMenu({ nx, ny })} />
+      )}
+      {actionMenu && (
+        <RadialMenu
+          center={{ x: actionMenu.nx * window.innerWidth, y: actionMenu.ny * window.innerHeight }}
+          onSelect={(action) => { dispatchAction(action, actionMenu.nx, actionMenu.ny); setActionMenu(null); }}
+          onCancel={() => setActionMenu(null)} />
+      )}
+      {isWidget && axTrusted !== null && (
+        <div style={{ position: "fixed", top: 8, left: "50%", transform: "translateX(-50%)",
+          zIndex: 70, pointerEvents: "none", fontSize: 11, fontWeight: 600,
+          padding: "3px 12px", borderRadius: 999, color: "#fff", backdropFilter: "blur(8px)",
+          background: axTrusted ? "rgba(16,120,60,0.85)" : "rgba(160,32,32,0.92)" }}>
+          {axTrusted ? "Accessibility ✓ — clicks can land" : "Accessibility ✗ — clicks will NOT land"}
+        </div>
       )}
       {live && <ConfidenceMeter value={meterValue} />}
 

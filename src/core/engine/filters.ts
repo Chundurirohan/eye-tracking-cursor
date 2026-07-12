@@ -29,16 +29,31 @@ export class OneEuroFilter {
 }
 
 export class GazeSmoother {
-  // Higher minCutoff + beta = the cursor keeps up with the gaze (responsive)
-  // instead of lagging heavily behind it, while still steadying at a fixation.
-  private fx = new OneEuroFilter(2.2, 0.02);
-  private fy = new OneEuroFilter(2.2, 0.02);
+  // Two-mode cursor. A single filter can't serve both goals: heavy smoothing
+  // gives rock-steady fixations (good for dwell) but lags badly on saccades;
+  // light smoothing tracks saccades but jitters at rest. So we smooth calmly by
+  // default (low minCutoff kills fixation jitter) and, when a saccade is
+  // detected (velocity spike), drop the filter history so the cursor TELEPORTS
+  // to the new location instead of gliding behind it.
+  private fx = new OneEuroFilter(1.3, 0.015);
+  private fy = new OneEuroFilter(1.3, 0.015);
+  private last: { x: number; y: number; t: number } | null = null;
+
+  // Normalized screen units per second. Deliberate gaze jumps far exceed this;
+  // fixation jitter stays well below it.
+  private static SACCADE_V = 2.6;
 
   filter(x: number, y: number, tMs: number) {
     const t = tMs / 1000;
+    if (this.last) {
+      const dt = Math.max(1e-3, t - this.last.t);
+      const v = Math.hypot(x - this.last.x, y - this.last.y) / dt;
+      if (v > GazeSmoother.SACCADE_V) { this.fx.reset(); this.fy.reset(); } // teleport
+    }
+    this.last = { x, y, t };
     return { x: this.fx.filter(x, t), y: this.fy.filter(y, t) };
   }
 
   reseed(x: number, y: number, tMs: number) { this.reset(); return this.filter(x, y, tMs); }
-  reset() { this.fx.reset(); this.fy.reset(); }
+  reset() { this.fx.reset(); this.fy.reset(); this.last = null; }
 }

@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { confidenceLook } from "@/features/shared/confidenceColor";
-import { warpCursor } from "@/core/system/nativeInput";
+import { warpCursor, snapTarget } from "@/core/system/nativeInput";
 
 const DWELL_MS = 800;       // hold gaze on a target this long to click
 const COOLDOWN_MS = 600;    // min gap between clicks
 const STALE_MS = 400;       // hide reticle if no gaze sample this recently
 const WARP_MS = 20;         // OS-cursor warp throttle
+const NATIVE_QUERY_MS = 110; // throttle for the async system-wide target lookup
+const NATIVE_FRESH_MS = 300; // how long a cached native-snap result stays usable
 // Snap radius as a fraction of the smaller screen dimension: gaze only has to
 // land within this of a control to lock (magnetically) onto it. Kept modest so
 // the cursor doesn't yank to the bar from far away (which reads as "off").
@@ -39,9 +41,16 @@ function nearestClickable(px: number, py: number): HTMLElement | null {
  * - When disarmed: the reticle still shows where you're looking, but the OS
  *   cursor is NOT touched (all control to the mouse/trackpad) and dwell is off.
  *   The reticle goes gray so you can see control is released. */
-export function DwellCursor({ active, armed, confidence, onNativeClick }: {
+export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibrate, menuOpen = false, onRequestMenu }: {
   active: boolean; armed: boolean; confidence: number | null;
   onNativeClick?: (nx: number, ny: number) => void;
+  /** Called on a confirmed click onto a known target center (gaze, target) —
+   *  feeds the self-healing drift corrector. Both points are normalized. */
+  onCalibrate?: (gaze: P, target: P) => void;
+  /** Whether the radial action menu is currently open (suppresses re-opening). */
+  menuOpen?: boolean;
+  /** A free-space dwell requests the radial action menu at this normalized point. */
+  onRequestMenu?: (nx: number, ny: number) => void;
 }) {
   const [disp, setDisp] = useState<P | null>(null); // reticle position (may be snapped)
   const [progress, setProgress] = useState(0);
@@ -60,6 +69,14 @@ export function DwellCursor({ active, armed, confidence, onNativeClick }: {
   const armedPosRef = useRef<P | null>(null);
   const clickRef = useRef(onNativeClick);
   clickRef.current = onNativeClick;
+  const calibrateRef = useRef(onCalibrate);
+  calibrateRef.current = onCalibrate;
+  const requestMenuRef = useRef(onRequestMenu);
+  requestMenuRef.current = onRequestMenu;
+  const menuOpenRef = useRef(menuOpen);
+  menuOpenRef.current = menuOpen;
+  const nativeRef = useRef<{ x: number; y: number; t: number } | null>(null); // cached system-wide snap
+  const nativeQueryRef = useRef(0);
 
   useEffect(() => {
     const onGaze = (e: Event) => { posRef.current = (e as CustomEvent<P>).detail; lastGazeRef.current = performance.now(); };
@@ -85,11 +102,29 @@ export function DwellCursor({ active, armed, confidence, onNativeClick }: {
       const px = p.x * window.innerWidth, py = p.y * window.innerHeight;
       const target = nearestClickable(px, py);
 
+      // System-wide magnetic snap: when no control of OUR app is near, throttled
+      // async lookup of the nearest clickable in ANY app (macOS Accessibility),
+      // cached across frames so the 60fps loop never blocks.
+      if (armed && !target && now - nativeQueryRef.current > NATIVE_QUERY_MS) {
+        nativeQueryRef.current = now;
+        snapTarget(p.x, p.y, SNAP_FRAC)
+          .then((r) => { nativeRef.current = r ? { x: r[0], y: r[1], t: performance.now() } : null; })
+          .catch(() => { nativeRef.current = null; });
+      }
+      let nativeSnap: P | null = null;
+      if (!target) {
+        const nt = nativeRef.current;
+        if (nt && now - nt.t < NATIVE_FRESH_MS && Math.hypot(nt.x - p.x, nt.y - p.y) < SNAP_FRAC * 3)
+          nativeSnap = { x: nt.x, y: nt.y };
+      }
+
       // Reticle + OS cursor position: snap onto a nearby control's center.
       let dispN = p;
       if (target) {
         const r = target.getBoundingClientRect();
         dispN = { x: (r.left + r.width / 2) / window.innerWidth, y: (r.top + r.height / 2) / window.innerHeight };
+      } else if (nativeSnap) {
+        dispN = nativeSnap;
       }
       setDisp(dispN);
 
@@ -100,7 +135,11 @@ export function DwellCursor({ active, armed, confidence, onNativeClick }: {
       if (armedElRef.current && target !== armedElRef.current) armedElRef.current = null;
       if (armedPosRef.current && (target || Math.hypot(p.x - armedPosRef.current.x, p.y - armedPosRef.current.y) > FREE_LEAVE)) armedPosRef.current = null;
 
-      if (!armed) { setRect(null); setProgress(0); targetRef.current = null; freeAnchorRef.current = null; return; }
+      // Disarmed (paused, or mouse-in-control): don't drive the OS cursor or
+      // click into other apps — but STILL allow dwell on OUR OWN controls, so
+      // the control bar (incl. Resume) is always gaze-operable and pausing can
+      // never deadlock the app.
+      if (!armed && !target) { setRect(null); setProgress(0); targetRef.current = null; freeAnchorRef.current = null; return; }
       const canClick = now - lastClickRef.current > COOLDOWN_MS;
 
       if (target) {
@@ -113,19 +152,25 @@ export function DwellCursor({ active, armed, confidence, onNativeClick }: {
         setProgress(prog);
         if (prog >= 1 && canClick) {
           target.click(); armedElRef.current = target; armedPosRef.current = null;
+          if (armed) calibrateRef.current?.(p, dispN); // dispN = DOM target center
           fire(now, r.left + r.width / 2, r.top + r.height / 2);
         }
       } else {
         targetRef.current = null; setRect(null);
+        const aim = nativeSnap ?? p; // where the click actually lands
         const a = freeAnchorRef.current;
         if (!a || Math.hypot(p.x - a.x, p.y - a.y) > FREE_TOL) { freeAnchorRef.current = { ...p }; dwellStartRef.current = now; }
         else freeAnchorRef.current = { x: a.x + ANCHOR_EMA * (p.x - a.x), y: a.y + ANCHOR_EMA * (p.y - a.y) };
         if (armedPosRef.current) { setProgress(0); return; }
         const prog = Math.min(1, (now - dwellStartRef.current) / DWELL_MS);
         setProgress(prog);
-        if (prog >= 1 && canClick) {
-          clickRef.current?.(p.x, p.y); armedPosRef.current = { ...p }; armedElRef.current = null;
-          fire(now, px, py);
+        if (prog >= 1 && canClick && !menuOpenRef.current) {
+          // Open the radial action menu at the aim point; the chosen petal
+          // dispatches the actual click type. (Direct left-click still available
+          // via the "Click" petal — kept as one glance.)
+          requestMenuRef.current?.(aim.x, aim.y);
+          armedPosRef.current = { ...p }; armedElRef.current = null;
+          fire(now, aim.x * window.innerWidth, aim.y * window.innerHeight);
         }
       }
     };

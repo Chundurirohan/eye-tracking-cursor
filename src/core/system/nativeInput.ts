@@ -26,3 +26,48 @@ export function nativeClick(nx: number, ny: number): void {
   if (!inTauri) return;
   void invoke("mouse_click", { nx, ny }).catch(() => {});
 }
+
+/** Inject a real right click at the gaze point (opens context menus). */
+export function nativeRightClick(nx: number, ny: number): void {
+  if (!inTauri) return;
+  void invoke("mouse_right_click", { nx, ny }).catch(() => {});
+}
+
+/** Inject a real double click at the gaze point. */
+export function nativeDoubleClick(nx: number, ny: number): void {
+  if (!inTauri) return;
+  void invoke("mouse_double_click", { nx, ny }).catch(() => {});
+}
+
+/** Whether the app currently has effective macOS Accessibility permission.
+ * Synthetic clicks silently no-op when this is false. */
+export async function isTrusted(): Promise<boolean> {
+  if (!inTauri) return false;
+  try { return (await invoke("is_trusted")) as boolean; } catch { return false; }
+}
+
+/** The set of gaze actions the radial menu can dispatch. */
+export type GazeAction = "left" | "right" | "double";
+
+/** Dispatch a chosen gaze action at a normalized point. */
+export function dispatchAction(action: GazeAction, nx: number, ny: number): void {
+  if (action === "right") nativeRightClick(nx, ny);
+  else if (action === "double") nativeDoubleClick(nx, ny);
+  else nativeClick(nx, ny);
+}
+
+/** Nearest clickable UI element (in ANY app) within `radius` of the gaze point.
+ * Returns [nx, ny, wNorm, hNorm] of the target center (normalized to window
+ * content), or null. Powers system-wide magnetic snapping. */
+export async function snapTarget(
+  nx: number, ny: number, radius: number,
+): Promise<[number, number, number, number] | null> {
+  if (!inTauri) return null;
+  try {
+    return (await invoke("snap_target", { nx, ny, radius })) as
+      | [number, number, number, number]
+      | null;
+  } catch {
+    return null;
+  }
+}

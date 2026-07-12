@@ -62,23 +62,240 @@ mod mac_input {
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::geometry::CGPoint;
 
-    fn event(kind: CGEventType, x: f64, y: f64) -> Result<CGEvent, String> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWarpMouseCursorPosition(new_position: CGPoint) -> i32;
+        fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+    }
+
+    fn event(kind: CGEventType, btn: CGMouseButton, x: f64, y: f64) -> Result<CGEvent, String> {
         let src = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| "event source".to_string())?;
-        CGEvent::new_mouse_event(src, kind, CGPoint::new(x, y), CGMouseButton::Left)
+        CGEvent::new_mouse_event(src, kind, CGPoint::new(x, y), btn)
             .map_err(|_| "mouse event".to_string())
     }
 
+    /// Move the OS cursor. Uses CGWarp, which does NOT require Accessibility, so
+    /// the cursor locks to the gaze reticle even before click permission is
+    /// granted. (Synthetic-event movement needed Accessibility and silently
+    /// no-op'd without it — the "reticle moves but cursor doesn't" bug.)
     pub fn warp(x: f64, y: f64) -> Result<(), String> {
-        event(CGEventType::MouseMoved, x, y)?.post(CGEventTapLocation::HID);
+        unsafe {
+            CGWarpMouseCursorPosition(CGPoint::new(x, y));
+            // Re-link pointer input so it stays responsive (CGWarp otherwise
+            // briefly suppresses movement).
+            CGAssociateMouseAndMouseCursorPosition(true);
+        }
         Ok(())
     }
 
+    /// Click at (x,y): warp there, then post a realistic move → down → up. The
+    /// button events DO require Accessibility permission (unavoidable for
+    /// injecting clicks into other apps). A move event (so the target registers
+    /// the pointer) plus a short gap between down and up makes it read as a
+    /// genuine click — an instantaneous down/up is dropped by some apps.
     pub fn click(x: f64, y: f64) -> Result<(), String> {
-        event(CGEventType::LeftMouseDown, x, y)?.post(CGEventTapLocation::HID);
-        event(CGEventType::LeftMouseUp, x, y)?.post(CGEventTapLocation::HID);
+        unsafe { CGWarpMouseCursorPosition(CGPoint::new(x, y)); }
+        event(CGEventType::MouseMoved, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
+        event(CGEventType::LeftMouseDown, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
+        std::thread::sleep(std::time::Duration::from_millis(12));
+        event(CGEventType::LeftMouseUp, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
         Ok(())
     }
+
+    /// Right-click at (x,y) — opens context menus.
+    pub fn right_click(x: f64, y: f64) -> Result<(), String> {
+        unsafe { CGWarpMouseCursorPosition(CGPoint::new(x, y)); }
+        event(CGEventType::MouseMoved, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
+        event(CGEventType::RightMouseDown, CGMouseButton::Right, x, y)?.post(CGEventTapLocation::HID);
+        std::thread::sleep(std::time::Duration::from_millis(12));
+        event(CGEventType::RightMouseUp, CGMouseButton::Right, x, y)?.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    /// Double-click at (x,y) — two rapid left clicks (system coalesces by timing).
+    pub fn double_click(x: f64, y: f64) -> Result<(), String> {
+        unsafe { CGWarpMouseCursorPosition(CGPoint::new(x, y)); }
+        event(CGEventType::MouseMoved, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
+        for _ in 0..2 {
+            event(CGEventType::LeftMouseDown, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
+            event(CGEventType::LeftMouseUp, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
+        }
+        Ok(())
+    }
+}
+
+// --- System-wide target snapping via the macOS Accessibility API ------------
+// Enumerates clickable UI elements from OTHER apps near the gaze point so the
+// cursor can magnetically snap onto small buttons anywhere on screen (not just
+// this app's own controls). Uses position hit-tests (AXUIElementCopyElementAt-
+// Position), which are cheap and independent of the target app's UI-tree size.
+// Requires macOS Accessibility permission (already needed for cursor control).
+#[cfg(target_os = "macos")]
+mod mac_ax {
+    use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+    use core_foundation::string::{CFString, CFStringRef};
+    use core_graphics::geometry::{CGPoint, CGSize};
+    use std::os::raw::c_void;
+
+    pub type AXUIElementRef = *const c_void;
+    const K_AX_VALUE_CGPOINT: u32 = 1;
+    const K_AX_VALUE_CGSIZE: u32 = 2;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+        fn AXUIElementCopyElementAtPosition(
+            app: AXUIElementRef, x: f32, y: f32, out: *mut AXUIElementRef,
+        ) -> i32;
+        fn AXUIElementCopyAttributeValue(
+            el: AXUIElementRef, attr: CFStringRef, out: *mut CFTypeRef,
+        ) -> i32;
+        fn AXUIElementGetPid(el: AXUIElementRef, pid: *mut i32) -> i32;
+        fn AXValueGetValue(value: CFTypeRef, the_type: u32, out: *mut c_void) -> bool;
+    }
+
+    fn is_clickable(role: &str) -> bool {
+        matches!(
+            role,
+            "AXButton" | "AXLink" | "AXMenuItem" | "AXMenuButton" | "AXPopUpButton"
+                | "AXCheckBox" | "AXRadioButton" | "AXTextField" | "AXComboBox"
+                | "AXTabButton" | "AXMenuBarItem" | "AXDisclosureTriangle" | "AXSearchField"
+        )
+    }
+
+    /// Copy an attribute value (+1 retained; caller must CFRelease).
+    unsafe fn copy_attr(el: AXUIElementRef, attr: &str) -> Option<CFTypeRef> {
+        let key = CFString::new(attr);
+        let mut out: CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(el, key.as_concrete_TypeRef(), &mut out);
+        if err == 0 && !out.is_null() { Some(out) } else { None }
+    }
+
+    unsafe fn ax_role(el: AXUIElementRef) -> Option<String> {
+        let v = copy_attr(el, "AXRole")?;
+        // Owned via create rule -> auto-released on drop.
+        let s = CFString::wrap_under_create_rule(v as CFStringRef).to_string();
+        Some(s)
+    }
+
+    unsafe fn ax_point(el: AXUIElementRef) -> Option<CGPoint> {
+        let v = copy_attr(el, "AXPosition")?;
+        let mut p = CGPoint { x: 0.0, y: 0.0 };
+        let ok = AXValueGetValue(v, K_AX_VALUE_CGPOINT, &mut p as *mut _ as *mut c_void);
+        CFRelease(v);
+        if ok { Some(p) } else { None }
+    }
+
+    unsafe fn ax_size(el: AXUIElementRef) -> Option<CGSize> {
+        let v = copy_attr(el, "AXSize")?;
+        let mut s = CGSize { width: 0.0, height: 0.0 };
+        let ok = AXValueGetValue(v, K_AX_VALUE_CGSIZE, &mut s as *mut _ as *mut c_void);
+        CFRelease(v);
+        if ok { Some(s) } else { None }
+    }
+
+    unsafe fn same_pid(el: AXUIElementRef, mine: i32) -> bool {
+        let mut pid: i32 = 0;
+        AXUIElementGetPid(el, &mut pid);
+        pid == mine
+    }
+
+    /// Walk from `start` up to a nearby actionable ancestor; return its global
+    /// rect center + size in logical points. `start` is owned by the caller.
+    unsafe fn actionable_rect(start: AXUIElementRef) -> Option<(f64, f64, f64, f64)> {
+        let mut cur = start;
+        let mut owned: Option<AXUIElementRef> = None;
+        let mut result = None;
+        for _ in 0..4 {
+            if let Some(role) = ax_role(cur) {
+                if is_clickable(&role) {
+                    if let (Some(p), Some(s)) = (ax_point(cur), ax_size(cur)) {
+                        if s.width > 1.0 && s.height > 1.0 {
+                            result = Some((p.x + s.width / 2.0, p.y + s.height / 2.0, s.width, s.height));
+                            break;
+                        }
+                    }
+                }
+            }
+            let parent = copy_attr(cur, "AXParent");
+            if let Some(prev) = owned.take() { CFRelease(prev); }
+            match parent {
+                Some(p) => { owned = Some(p); cur = p as AXUIElementRef; }
+                None => break,
+            }
+        }
+        if let Some(prev) = owned.take() { CFRelease(prev); }
+        result
+    }
+
+    fn probe_offsets(r: f64) -> Vec<(f64, f64)> {
+        let mut v = vec![(0.0, 0.0)];
+        for ring in [0.5f64, 1.0] {
+            let rr = r * ring;
+            for k in 0..8 {
+                let a = std::f64::consts::PI * (k as f64) / 4.0;
+                v.push((rr * a.cos(), rr * a.sin()));
+            }
+        }
+        v
+    }
+
+    /// Nearest clickable target (from another app) within `radius` logical
+    /// points of the gaze point. Returns (center_x, center_y, w, h) or None.
+    pub unsafe fn nearest_target(gx: f64, gy: f64, radius: f64, my_pid: i32) -> Option<(f64, f64, f64, f64)> {
+        let sys = AXUIElementCreateSystemWide();
+        if sys.is_null() { return None; }
+        // A position hit-test on the SYSTEM-WIDE element returns our own
+        // always-on-top transparent overlay, never the app beneath it. So hit-
+        // test the FOCUSED APPLICATION's element instead: that resolves inside
+        // the real app the user is working in, regardless of our overlay's
+        // z-order. (If our overlay is itself focused, there's nothing to snap.)
+        let app = copy_attr(sys, "AXFocusedApplication");
+        CFRelease(sys as CFTypeRef);
+        let app = match app { Some(a) => a as AXUIElementRef, None => return None };
+        if same_pid(app, my_pid) { CFRelease(app as CFTypeRef); return None; }
+
+        let mut best: Option<(f64, f64, f64, f64, f64)> = None; // (dist, cx, cy, w, h)
+        for (ox, oy) in probe_offsets(radius) {
+            let mut el: AXUIElementRef = std::ptr::null();
+            let err = AXUIElementCopyElementAtPosition(app, (gx + ox) as f32, (gy + oy) as f32, &mut el);
+            if err != 0 || el.is_null() { continue; }
+            if let Some((cx, cy, w, h)) = actionable_rect(el) {
+                let d = ((cx - gx).powi(2) + (cy - gy).powi(2)).sqrt();
+                if best.map_or(true, |b| d < b.0) { best = Some((d, cx, cy, w, h)); }
+            }
+            CFRelease(el as CFTypeRef);
+        }
+        CFRelease(app as CFTypeRef);
+        best.map(|(_, cx, cy, w, h)| (cx, cy, w, h))
+    }
+}
+
+/// Snap to the nearest system-wide clickable near a gaze point (normalized to
+/// window content). Returns (nx, ny, w_norm, h_norm) of the target center, or
+/// None. All AX complexity is isolated here; the frontend just gets a point.
+#[tauri::command]
+fn snap_target(window: tauri::WebviewWindow, nx: f64, ny: f64, radius: f64) -> Result<Option<(f64, f64, f64, f64)>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let pos = window.inner_position().map_err(|e| format!("inner_position: {e}"))?;
+        let size = window.inner_size().map_err(|e| format!("inner_size: {e}"))?;
+        let scale = window.scale_factor().map_err(|e| format!("scale_factor: {e}"))?;
+        let (w, h) = (size.width as f64, size.height as f64);
+        let gx = (pos.x as f64 + nx * w) / scale;
+        let gy = (pos.y as f64 + ny * h) / scale;
+        let radius_px = radius * w / scale;
+        let my_pid = std::process::id() as i32;
+        let res = unsafe { mac_ax::nearest_target(gx, gy, radius_px, my_pid) };
+        Ok(res.map(|(cx, cy, tw, th)| {
+            let bnx = (cx * scale - pos.x as f64) / w;
+            let bny = (cy * scale - pos.y as f64) / h;
+            (bnx, bny, tw * scale / w, th * scale / h)
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (window, nx, ny, radius); Ok(None) }
 }
 
 /// Map a gaze point normalized to the window's content (0–1) to a global screen
@@ -109,7 +326,41 @@ fn warp_cursor(window: tauri::WebviewWindow, nx: f64, ny: f64) -> Result<(), Str
 #[tauri::command]
 fn mouse_click(window: tauri::WebviewWindow, nx: f64, ny: f64) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    { let (x, y) = to_global(&window, nx, ny)?; mac_input::click(x, y) }
+    {
+        let (x, y) = to_global(&window, nx, ny)?;
+        // Guarantee the overlay is click-through at the instant of the click so
+        // the synthetic event passes to the app beneath instead of being caught
+        // by our own always-on-top window (the "shield"). Don't rely on the
+        // frontend having already asserted it.
+        let _ = window.set_ignore_cursor_events(true);
+        mac_input::click(x, y)
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (window, nx, ny); Err("native clicking is macOS-only".into()) }
+}
+
+/// Right-click at a gaze point (normalized to window content) — context menus.
+#[tauri::command]
+fn mouse_right_click(window: tauri::WebviewWindow, nx: f64, ny: f64) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let (x, y) = to_global(&window, nx, ny)?;
+        let _ = window.set_ignore_cursor_events(true);
+        mac_input::right_click(x, y)
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (window, nx, ny); Err("native clicking is macOS-only".into()) }
+}
+
+/// Double-click at a gaze point (normalized to window content).
+#[tauri::command]
+fn mouse_double_click(window: tauri::WebviewWindow, nx: f64, ny: f64) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let (x, y) = to_global(&window, nx, ny)?;
+        let _ = window.set_ignore_cursor_events(true);
+        mac_input::double_click(x, y)
+    }
     #[cfg(not(target_os = "macos"))]
     { let _ = (window, nx, ny); Err("native clicking is macOS-only".into()) }
 }
@@ -124,28 +375,85 @@ fn set_click_through(window: tauri::WebviewWindow, on: bool) -> Result<(), Strin
         .map_err(|e| format!("set_ignore_cursor_events: {e}"))
 }
 
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: core_foundation::dictionary::CFDictionaryRef) -> bool;
+    static kAXTrustedCheckOptionPrompt: core_foundation::string::CFStringRef;
+}
+
+/// Whether this app currently has effective macOS Accessibility permission.
+/// Synthetic clicks (`mouse_click` etc.) silently no-op when this is false —
+/// this is the definitive check for "is the permission actually working", vs a
+/// stale toggle in System Settings.
+#[tauri::command]
+fn is_trusted() -> bool {
+    #[cfg(target_os = "macos")]
+    { unsafe { AXIsProcessTrusted() } }
+    #[cfg(not(target_os = "macos"))]
+    { true }
+}
+
+/// Show the real macOS "grant Accessibility" prompt and register this exact
+/// binary in the Accessibility list, if not already trusted. This is the
+/// reliable way to get the app added/granted — manually hunting for it in
+/// System Settings is what left it stuck at "not trusted".
+#[cfg(target_os = "macos")]
+fn prompt_accessibility() -> bool {
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
+    unsafe {
+        let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
+        let opts = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::true_value().as_CFType())]);
+        AXIsProcessTrustedWithOptions(opts.as_concrete_TypeRef())
+    }
+}
+
+/// Frontend-callable version of the prompt (e.g. from a "Grant access" button).
+#[tauri::command]
+fn request_accessibility() -> bool {
+    #[cfg(target_os = "macos")]
+    { prompt_accessibility() }
+    #[cfg(not(target_os = "macos"))]
+    { true }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     use tauri::Emitter;
     use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-    // ⌃⌥Space arms/disarms gaze control of the cursor. Global so it works even
-    // when the click-through overlay has no focus.
+    // ⌃⌥Space arms/disarms gaze control of the cursor. ⌃⌥P pauses/resumes.
+    // Global so they work even when the click-through overlay has no focus — and
+    // so pause can always be escaped by keyboard even if the control bar isn't
+    // reachable.
     let arm_toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
+    let pause_toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, shortcut, event| {
-                    if shortcut == &arm_toggle && event.state() == ShortcutState::Pressed {
+                    if event.state() != ShortcutState::Pressed { return; }
+                    if shortcut == &arm_toggle {
                         let _ = app.emit("gaze:toggle-armed", ());
+                    } else if shortcut == &pause_toggle {
+                        let _ = app.emit("gaze:toggle-pause", ());
                     }
                 })
                 .build(),
         )
         .setup(move |app| {
             app.global_shortcut().register(arm_toggle)?;
+            app.global_shortcut().register(pause_toggle)?;
+            // Surface the real Accessibility prompt on launch if we're not yet
+            // trusted, so the app gets registered/granted properly.
+            #[cfg(target_os = "macos")]
+            { let _ = prompt_accessibility(); }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -154,7 +462,12 @@ pub fn run() {
             clear_session,
             warp_cursor,
             mouse_click,
-            set_click_through
+            mouse_right_click,
+            mouse_double_click,
+            set_click_through,
+            snap_target,
+            is_trusted,
+            request_accessibility
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
