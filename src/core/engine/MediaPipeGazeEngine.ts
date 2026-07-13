@@ -3,7 +3,7 @@ import {
 } from "@mediapipe/tasks-vision";
 import type { IGazeEngine } from "./IGazeEngine";
 import type { GazeFrame, GazeFeature, HeadPose, EngineCapabilities, FaceLandmark } from "./types";
-import { GazeSmoother } from "./filters";
+import { AdaptivePredictiveFilter } from "./filters";
 import { confidenceFactors, confidenceOf } from "./confidence";
 import type { CalibrationModel } from "../calibration/types";
 import { applyCalibration } from "../calibration/grid";
@@ -25,7 +25,7 @@ export class MediaPipeGazeEngine implements IGazeEngine {
   };
 
   private landmarker: FaceLandmarker | null = null;
-  private smoother = new GazeSmoother();
+  private smoother = new AdaptivePredictiveFilter();
   private calibration: CalibrationModel | null = null;
   private collecting = false;
   private lastLandmarks: FaceLandmark[] | null = null;
@@ -83,9 +83,16 @@ export class MediaPipeGazeEngine implements IGazeEngine {
     // Head position + distance from the outer eye corners (33 = left, 263 =
     // right), so calibration can compensate for the head moving/leaning.
     const lo = lm[33]!, ro = lm[263]!;
+    // Confidence-weighted eye fusion: weight each eye by its openness so a
+    // squinting / occluded / glare-hit eye contributes less (a small floor keeps
+    // a fully-closed eye from zeroing the sum). Falls back to equal weight when
+    // both eyes are open.
+    const wL = Math.max(0.05, eyeOpenness.left);
+    const wR = Math.max(0.05, eyeOpenness.right);
+    const wSum = wL + wR;
     const feature: GazeFeature = {
-      ix: (leftVec.x + rightVec.x) / 2,
-      iy: (leftVec.y + rightVec.y) / 2,
+      ix: (wL * leftVec.x + wR * rightVec.x) / wSum,
+      iy: (wL * leftVec.y + wR * rightVec.y) / wSum,
       lix: leftVec.x, liy: leftVec.y,
       rix: rightVec.x, riy: rightVec.y,
       yaw: headPose?.yaw ?? 0,
@@ -115,7 +122,7 @@ export class MediaPipeGazeEngine implements IGazeEngine {
 
     let point: GazeFrame["point"] = null;
     if (rawPoint && confidence > 0.2) {
-      const s = this.smoother.filter(rawPoint.x, rawPoint.y, now);
+      const s = this.smoother.update(rawPoint.x, rawPoint.y, confidence, now);
       point = { x: clamp01(s.x), y: clamp01(s.y) };
     }
 

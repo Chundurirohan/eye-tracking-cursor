@@ -15,6 +15,7 @@ import { Toggle } from "@/features/shared/Toggle";
 import { useHotkeys } from "@/features/shared/useHotkeys";
 import { setClickThrough, nativeClick, dispatchAction, isTrusted } from "@/core/system/nativeInput";
 import { RadialMenu } from "@/features/tracking/RadialMenu";
+import { PoseAdaptiveCorrector } from "@/core/engine/adaptation";
 import { listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/store/settings";
 import { QUALITY_THRESHOLD } from "@/core/session/machine";
@@ -48,6 +49,13 @@ function Inner() {
   const cameraRef = useRef<CameraManager | null>(null);
   const engineRef = useRef<IGazeEngine | null>(null);
   const rafRef = useRef(0);
+  // Pose-adaptive drift correction + manual re-anchor capture.
+  const adaptRef = useRef(new PoseAdaptiveCorrector());
+  const reanchorRef = useRef(false);
+  const reanchorStartRef = useRef(0);
+  const reanchorSamplesRef = useRef<{ x: number; y: number }[]>([]);
+  const [reanchoring, setReanchoring] = useState(false);
+  const headPoseRef = useRef<{ yaw: number; pitch: number } | null>(null);
   const previewRef = useRef<HTMLVideoElement>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -139,9 +147,29 @@ function Inner() {
         const seen = Math.max(0, Math.min(1, frame.confidence / 0.6));
         gazeConf = stability * seen;
 
-        const w = Math.max(0, Math.min(1, (spread - 0.015) / (0.06 - 0.015))); // 0 fixate, 1 move
-        const out = { x: cx + (frame.point.x - cx) * w, y: cy + (frame.point.y - cy) * w };
-        window.dispatchEvent(new CustomEvent("gaze:point", { detail: out }));
+        // The engine's adaptive-predictive filter now does smoothing + fixation
+        // lock, so pass its point straight through (no double-smoothing here).
+        const out = { x: frame.point.x, y: frame.point.y };
+
+        // Manual re-anchor capture: while the user fixates the center dot, sample
+        // the PRE-correction gaze to measure current drift, then store a strong
+        // pose-keyed correction so the mapping re-centers for this head posture.
+        if (reanchorRef.current) {
+          if (now - reanchorStartRef.current > 600) reanchorSamplesRef.current.push({ x: out.x, y: out.y });
+          if (reanchorSamplesRef.current.length >= 30) {
+            const s = reanchorSamplesRef.current;
+            const avg = { x: s.reduce((a, q) => a + q.x, 0) / s.length, y: s.reduce((a, q) => a + q.y, 0) / s.length };
+            adaptRef.current.reanchor(avg, { x: 0.5, y: 0.5 }, frame.headPose ?? null);
+            reanchorRef.current = false; reanchorSamplesRef.current = [];
+            setReanchoring(false);
+          }
+        }
+
+        // Pose-adaptive drift correction: shift by the correction learned for the
+        // current head pose, so accuracy holds as the head deviates from calibration.
+        headPoseRef.current = frame.headPose ?? null;
+        const adapted = adaptRef.current.apply(out, frame.headPose ?? null);
+        window.dispatchEvent(new CustomEvent("gaze:point", { detail: adapted }));
       } else {
         recent.length = 0;
       }
@@ -221,6 +249,19 @@ function Inner() {
     return () => { void un.then((f) => f()); };
   }, [send]);
 
+  // ⌃⌥R (global shortcut) — quick re-anchor: look at the center dot for ~1s to
+  // re-center the mapping for your current head posture (fixes accumulated drift
+  // without a full recalibration).
+  useEffect(() => {
+    const un = listen("gaze:reanchor", () => {
+      reanchorRef.current = true;
+      reanchorStartRef.current = performance.now();
+      reanchorSamplesRef.current = [];
+      setReanchoring(true);
+    });
+    return () => { void un.then((f) => f()); };
+  }, []);
+
   // Auto-dismiss the radial action menu if it's left untouched for a few seconds.
   useEffect(() => {
     if (!actionMenu) return;
@@ -260,7 +301,8 @@ function Inner() {
         <DwellCursor active={isWidget} armed={armed && state === "tracking"}
           confidence={trackConf} onNativeClick={nativeClick}
           menuOpen={!!actionMenu}
-          onRequestMenu={(nx, ny) => setActionMenu({ nx, ny })} />
+          onRequestMenu={(nx, ny) => setActionMenu({ nx, ny })}
+          onCalibrate={(gaze, target) => adaptRef.current.observe(gaze, target, headPoseRef.current)} />
       )}
       {actionMenu && (
         <RadialMenu
@@ -274,6 +316,17 @@ function Inner() {
           padding: "3px 12px", borderRadius: 999, color: "#fff", backdropFilter: "blur(8px)",
           background: axTrusted ? "rgba(16,120,60,0.85)" : "rgba(160,32,32,0.92)" }}>
           {axTrusted ? "Accessibility ✓ — clicks can land" : "Accessibility ✗ — clicks will NOT land"}
+        </div>
+      )}
+      {reanchoring && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 80, pointerEvents: "none",
+          display: "grid", placeItems: "center", gap: 14 }}>
+          <div style={{ width: 22, height: 22, borderRadius: 999, background: "var(--accent, #3c82f6)",
+            boxShadow: "0 0 0 6px rgba(60,130,246,0.22), 0 0 26px rgba(60,130,246,0.6)" }} />
+          <div style={{ fontSize: 13, fontWeight: 600, color: "#fff", background: "rgba(0,0,0,0.6)",
+            padding: "5px 14px", borderRadius: 999, backdropFilter: "blur(8px)" }}>
+            Look at the dot to re-center…
+          </div>
         </div>
       )}
       {live && <ConfidenceMeter value={meterValue} />}

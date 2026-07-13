@@ -39,6 +39,12 @@ export function nativeDoubleClick(nx: number, ny: number): void {
   void invoke("mouse_double_click", { nx, ny }).catch(() => {});
 }
 
+/** Scroll the app under the cursor vertically by `dy` pixels (sign = direction). */
+export function nativeScroll(dy: number): void {
+  if (!inTauri) return;
+  void invoke("mouse_scroll", { dy: Math.round(dy) }).catch(() => {});
+}
+
 /** Whether the app currently has effective macOS Accessibility permission.
  * Synthetic clicks silently no-op when this is false. */
 export async function isTrusted(): Promise<boolean> {

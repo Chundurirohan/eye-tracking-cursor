@@ -61,11 +61,18 @@ mod mac_input {
     };
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::geometry::CGPoint;
+    use std::os::raw::c_void;
 
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGWarpMouseCursorPosition(new_position: CGPoint) -> i32;
         fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+        // Variadic in C — declared with `...` so the wheel deltas use the
+        // correct variadic ABI (critical on Apple Silicon).
+        fn CGEventCreateScrollWheelEvent(
+            source: *const c_void, units: u32, wheel_count: u32, ...
+        ) -> *const c_void;
+        fn CGEventPost(tap: u32, event: *const c_void);
     }
 
     fn event(kind: CGEventType, btn: CGMouseButton, x: f64, y: f64) -> Result<CGEvent, String> {
@@ -120,6 +127,19 @@ mod mac_input {
         for _ in 0..2 {
             event(CGEventType::LeftMouseDown, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
             event(CGEventType::LeftMouseUp, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
+        }
+        Ok(())
+    }
+
+    /// Scroll vertically by `dy` pixels (sign = direction). Posted as a scroll-
+    /// wheel event so it works in any app.
+    pub fn scroll(dy: i32) -> Result<(), String> {
+        unsafe {
+            // units=0 (pixel), wheelCount=1, wheel1=dy (variadic).
+            let e = CGEventCreateScrollWheelEvent(std::ptr::null(), 0, 1, dy);
+            if e.is_null() { return Err("scroll event".into()); }
+            CGEventPost(0, e); // 0 = HID event tap
+            core_foundation::base::CFRelease(e);
         }
         Ok(())
     }
@@ -365,6 +385,19 @@ fn mouse_double_click(window: tauri::WebviewWindow, nx: f64, ny: f64) -> Result<
     { let _ = (window, nx, ny); Err("native clicking is macOS-only".into()) }
 }
 
+/// Scroll the app under the cursor vertically by `dy` pixels. Powers edge-gaze
+/// scrolling / hands-free reading.
+#[tauri::command]
+fn mouse_scroll(window: tauri::WebviewWindow, dy: i32) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window.set_ignore_cursor_events(true);
+        mac_input::scroll(dy)
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (window, dy); Err("native scrolling is macOS-only".into()) }
+}
+
 /// Make the overlay window transparent to mouse events (click-through) or not.
 /// Done in Rust so it isn't gated by the JS permission ACL (which was silently
 /// denying the equivalent JS call and leaving the overlay blocking clicks).
@@ -432,6 +465,7 @@ pub fn run() {
     // reachable.
     let arm_toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
     let pause_toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
+    let reanchor = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyR);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -443,6 +477,8 @@ pub fn run() {
                         let _ = app.emit("gaze:toggle-armed", ());
                     } else if shortcut == &pause_toggle {
                         let _ = app.emit("gaze:toggle-pause", ());
+                    } else if shortcut == &reanchor {
+                        let _ = app.emit("gaze:reanchor", ());
                     }
                 })
                 .build(),
@@ -450,6 +486,7 @@ pub fn run() {
         .setup(move |app| {
             app.global_shortcut().register(arm_toggle)?;
             app.global_shortcut().register(pause_toggle)?;
+            app.global_shortcut().register(reanchor)?;
             // Surface the real Accessibility prompt on launch if we're not yet
             // trusted, so the app gets registered/granted properly.
             #[cfg(target_os = "macos")]
@@ -464,6 +501,7 @@ pub fn run() {
             mouse_click,
             mouse_right_click,
             mouse_double_click,
+            mouse_scroll,
             set_click_through,
             snap_target,
             is_trusted,
