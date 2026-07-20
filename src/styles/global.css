@@ -29,6 +29,16 @@ button { font-family: inherit; cursor: default; border: none; background: none; 
   box-shadow: var(--shadow-soft);
 }
 
+/* Accessibility (spec §I): honor the system Reduce Transparency setting — glass
+   surfaces fall back to a solid, high-legibility background. */
+@media (prefers-reduced-transparency: reduce) {
+  .glass {
+    background: var(--bg);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
 .dim { color: var(--text-2); }
 .mono { font-variant-numeric: tabular-nums; }
 

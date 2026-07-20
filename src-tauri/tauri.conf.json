@@ -23,6 +23,22 @@
         "decorations": false,
         "alwaysOnTop": true,
         "shadow": false
+      },
+      {
+        "label": "ring",
+        "title": "",
+        "width": 64,
+        "height": 64,
+        "x": 0,
+        "y": 0,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "shadow": false,
+        "focus": false,
+        "skipTaskbar": true,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {

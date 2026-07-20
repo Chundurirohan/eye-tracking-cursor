@@ -9,8 +9,9 @@ import type { GazeAction } from "@/core/system/nativeInput";
 
 // Secondary actions ringed around the center Click.
 const RING: { action: GazeAction; label: string; icon: string; deg: number }[] = [
-  { action: "double", label: "Double", icon: "⧉", deg: -145 },
-  { action: "right", label: "Right", icon: "☰", deg: -35 },
+  { action: "double", label: "Double", icon: "⧉", deg: -150 },
+  { action: "drag", label: "Drag", icon: "✥", deg: -90 },
+  { action: "right", label: "Right", icon: "☰", deg: -30 },
 ];
 
 const petalBase: React.CSSProperties = {

@@ -4,8 +4,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "setup:assets": "node scripts/setup-assets.mjs",
+    "dev": "npm run setup:assets && vite",
+    "build": "npm run setup:assets && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",

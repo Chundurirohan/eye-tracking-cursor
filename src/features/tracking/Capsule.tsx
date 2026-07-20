@@ -10,15 +10,25 @@ const STATUS_COLOR: Partial<Record<AppState, string>> = {
   tracking: "var(--good)", reacquiring: "var(--warn)", paused: "var(--text-3)",
 };
 
-export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrate, settingsSlot }: {
+export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrate, settingsSlot, onSettingsToggle }: {
   state: AppState;
   side: "left" | "right" | "center";
   armed?: boolean;
   onPauseToggle: () => void;
   onRecalibrate: () => void;
   settingsSlot: React.ReactNode;
+  /** Notifies the app when the settings popover opens/closes, so the HUD window
+   *  can grow to fit it and shrink back. */
+  onSettingsToggle?: (open: boolean) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpenRaw] = useState(false);
+  const setOpen = (v: boolean | ((o: boolean) => boolean)) => {
+    setOpenRaw((prev) => {
+      const next = typeof v === "function" ? v(prev) : v;
+      if (next !== prev) onSettingsToggle?.(next);
+      return next;
+    });
+  };
   const paused = state === "paused";
   const pos: React.CSSProperties =
     side === "left" ? { left: "var(--s-5)" } : side === "right" ? { right: "var(--s-5)" }
