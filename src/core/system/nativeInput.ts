@@ -58,6 +58,12 @@ export function logPerf(msg: string): void {
   void invoke("log_perf", { msg }).catch(() => {});
 }
 
+/** Set the menu-bar (tray) status text shown next to the icon. */
+export async function setTrayStatus(text: string): Promise<void> {
+  if (!inTauri) return;
+  try { await invoke("set_tray_status", { text }); } catch { /* ignore */ }
+}
+
 /** Open the macOS Accessibility settings pane so the user can grant/re-grant. */
 export async function openAccessibilitySettings(): Promise<void> {
   if (!inTauri) return;
@@ -119,11 +125,29 @@ export async function getGazeMapping(): Promise<GazeMapping | null> {
   try { return (await invoke("gaze_mapping")) as GazeMapping; } catch { return null; }
 }
 
-/** Morph the main window: "full" (maximized scenes), "capsule" (compact HUD),
- * or "expanded" (gaze-space-covering overlay). */
-export async function setWindowMode(mode: "full" | "capsule" | "expanded"): Promise<void> {
+/** Set the main window shape: "full" (setup/panels) or "hud" (compact tracking
+ * HUD). Opaque, instant frame-set — no animated zoom. */
+export async function setWindowMode(mode: "full" | "hud"): Promise<void> {
   if (!inTauri) return;
   try { await invoke("set_window_mode", { mode }); } catch { /* ignore */ }
+}
+
+/** Show an overlay window (wheel/keyboard) centered on a gaze point. */
+export async function showOverlayAt(label: string, nx: number, ny: number): Promise<void> {
+  if (!inTauri) return;
+  try { await invoke("show_overlay_at", { label, nx, ny }); } catch { /* ignore */ }
+}
+
+/** Show an overlay window docked bottom-center of the gaze space. */
+export async function showOverlayBottom(label: string): Promise<void> {
+  if (!inTauri) return;
+  try { await invoke("show_overlay_bottom", { label }); } catch { /* ignore */ }
+}
+
+/** Hide an overlay window. */
+export async function hideOverlay(label: string): Promise<void> {
+  if (!inTauri) return;
+  try { await invoke("hide_overlay", { label }); } catch { /* ignore */ }
 }
 
 /** List connected displays by name (for the multi-monitor picker). */

@@ -13,10 +13,11 @@ body {
   user-select: none;
 }
 
-/* Widget mode: after calibration the app is a transparent always-on-top overlay
-   (a floating widget), not an opaque window. The desktop shows through; only the
-   camera feed, control bar, confidence bar, and gaze cursor are painted. */
-body.widget, body.widget #root { background: transparent !important; }
+/* HUD mode: after calibration the main window shrinks to a small OPAQUE capsule
+   (its own always-on-top window). The auxiliary overlays (cursor ring, action
+   wheel, keyboard) are separate transparent windows — they clear their own body
+   background in JS, not here. The HUD stays a real, opaque, rounded panel. */
+body.hud, body.hud #root { background: transparent !important; }
 
 h1, h2, h3 { font-family: var(--font-display); font-weight: 600; letter-spacing: -0.02em; margin: 0; }
 button { font-family: inherit; cursor: default; border: none; background: none; color: inherit; }

@@ -7,7 +7,6 @@ import { PermissionGate } from "@/features/permissions/PermissionGate";
 import { CalibrationScene } from "@/features/calibration/CalibrationScene";
 import { Capsule } from "@/features/tracking/Capsule";
 import { DwellCursor } from "@/features/tracking/DwellCursor";
-import { OnScreenKeyboard } from "@/features/tracking/OnScreenKeyboard";
 import { Tutorial } from "@/features/tracking/Tutorial";
 import { ReacquiringPill } from "@/features/tracking/ReacquiringPill";
 import { AdvancedView, type Diagnostics } from "@/features/diagnostics/AdvancedView";
@@ -18,11 +17,12 @@ import { Slider } from "@/features/shared/Slider";
 import { Segmented } from "@/features/shared/Segmented";
 import { HelpSheet } from "@/features/shared/HelpSheet";
 import { useHotkeys } from "@/features/shared/useHotkeys";
-import { setClickThrough, nativeClick, dispatchAction, isTrusted,
+import { nativeClick, dispatchAction, isTrusted,
   openAccessibilitySettings, requestAccessibility,
   nativeDragStart, nativeDragEnd, moveToMonitor, listMonitors,
-  captureGazeSpace, getGazeMapping, setWindowMode, logPerf, type GazeMapping } from "@/core/system/nativeInput";
-import { RadialMenu } from "@/features/tracking/RadialMenu";
+  captureGazeSpace, getGazeMapping, setWindowMode, logPerf, setTrayStatus,
+  showOverlayAt, showOverlayBottom, hideOverlay, type GazeMapping } from "@/core/system/nativeInput";
+import { sendGazeGlobal } from "@/core/system/overlayBus";
 import { PoseAdaptiveCorrector } from "@/core/engine/adaptation";
 import { listen } from "@tauri-apps/api/event";
 import { useSettings, resolveDwell, type DwellPreset, type EmptyDwellAction, type ActivationMode } from "@/store/settings";
@@ -60,6 +60,8 @@ function Inner() {
   // Gaze control of the OS cursor. Armed by default post-calibration (cursor is
   // joined to the gaze); ⌃⌥Space disarms → all control to mouse/trackpad, no fight.
   const [armed, setArmed] = useState(true);
+  const armedRef = useRef(armed);
+  armedRef.current = armed;
   // Radial action menu: the normalized gaze point where it's anchored, or null.
   const [actionMenu, setActionMenu] = useState<{ nx: number; ny: number } | null>(null);
   // Effective Accessibility permission (null = unknown yet). Synthetic clicks
@@ -77,6 +79,9 @@ function Inner() {
   const dragStateRef = useRef(dragState);
   dragStateRef.current = dragState;
   const [showKeyboard, setShowKeyboard] = useState(false);
+  // Whether the current keyboard showing was auto-triggered by a focused text
+  // field (vs. manually opened) — auto keyboards hide when the field blurs.
+  const keyboardAutoRef = useRef(false);
   const [showHelp, setShowHelp] = useState(false);
   const [precision, setPrecision] = useState(false); // fine-targeting mode
   const [testing, setTesting] = useState(false);      // accuracy-test overlay
@@ -84,11 +89,16 @@ function Inner() {
   // --- Utility window shell -------------------------------------------------
   // Whether the settings popover is open (the HUD must grow to fit it).
   const [settingsOpen, setSettingsOpen] = useState(false);
-  // Gaze-space → window mapping for the current window shape.
+  // Gaze-space → window mapping for the current window shape (also lets the
+  // tracking loop convert gaze to global px for the overlay windows).
   const [mapping, setMapping] = useState<GazeMapping | null>(null);
-  // True once the window has actually expanded for a gaze-anchored overlay —
-  // gates rendering so overlays never draw into the small capsule for a frame.
-  const [expanded, setExpanded] = useState(false);
+  const mappingRef = useRef(mapping);
+  mappingRef.current = mapping;
+  const actionMenuRef = useRef(actionMenu);
+  actionMenuRef.current = actionMenu;
+  // Whether an overlay window (wheel/keyboard) is open and needs broadcast gaze.
+  const overlayWinOpenRef = useRef(false);
+  overlayWinOpenRef.current = !!actionMenu || showKeyboard;
   const needCaptureRef = useRef(true); // capture gaze space on next widget entry
   const morphSeqRef = useRef(0);       // ignore stale async morph completions
   // Idle auto-pause: last time a face was seen + drift-safe settings copy.
@@ -111,11 +121,14 @@ function Inner() {
   const [reanchoring, setReanchoring] = useState(false);
   const headPoseRef = useRef<{ yaw: number; pitch: number } | null>(null);
   const previewRef = useRef<HTMLVideoElement>(null);
+  const hudPreviewRef = useRef<HTMLVideoElement | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
   // Blink activation: current mode + timestamp the eyes went closed (0 = open).
   const activationRef = useRef(settings.activationMode);
   activationRef.current = settings.activationMode;
+  const autoKbdRef = useRef(settings.autoKeyboard);
+  autoKbdRef.current = settings.autoKeyboard;
   const blinkClosedSinceRef = useRef(0);
 
   if (!cameraRef.current) cameraRef.current = new CameraManager();
@@ -162,10 +175,19 @@ function Inner() {
   }, [send]);
 
   useEffect(() => {
-    const v = previewRef.current;
     const src = cameraRef.current!.video.srcObject;
-    if (v && src) { v.srcObject = src; void v.play().catch(() => {}); }
+    for (const v of [previewRef.current, hudPreviewRef.current]) {
+      if (v && src && v.srcObject !== src) { v.srcObject = src; void v.play().catch(() => {}); }
+    }
   }, [state, settings.cameraPreview, camLive]);
+
+  // Bind the live stream onto the HUD preview element the moment it mounts
+  // (it appears/disappears with the HUD, which this effect's deps don't track).
+  const bindHudPreview = useCallback((el: HTMLVideoElement | null) => {
+    hudPreviewRef.current = el;
+    const src = cameraRef.current?.video.srcObject;
+    if (el && src && el.srcObject !== src) { el.srcObject = src; void el.play().catch(() => {}); }
+  }, []);
 
   useEffect(() => {
     // The accuracy test drives its own estimate loop; only one may run at a time
@@ -262,6 +284,12 @@ function Inner() {
         headPoseRef.current = frame.headPose ?? null;
         const adapted = adaptRef.current.apply(out, frame.headPose ?? null);
         window.dispatchEvent(new CustomEvent("gaze:point", { detail: adapted }));
+        // Broadcast the gaze in global logical px to the overlay windows (wheel/
+        // keyboard) while one is open, so they can run their own local dwell.
+        if (overlayWinOpenRef.current && mappingRef.current) {
+          const m = mappingRef.current;
+          sendGazeGlobal((m.gsx + adapted.x * m.gsw) / m.scale, (m.gsy + adapted.y * m.gsh) / m.scale);
+        }
       } else {
         recent.length = 0;
       }
@@ -302,32 +330,29 @@ function Inner() {
     onToggleDiagnostics: () => setShowDiag((s) => !s),
   }), [send]));
 
-  // Make the OS window background transparent while in widget (post-calibration)
-  // mode, opaque otherwise (boot / permissions / calibration).
   const widgetMode = state === "tracking" || state === "paused" || state === "reacquiring";
-  useEffect(() => {
-    document.body.classList.toggle("widget", widgetMode);
-    return () => document.body.classList.remove("widget");
-  }, [widgetMode]);
 
   // Whether the first-run tutorial wants the screen.
   const tutorialVisible = state === "tracking" && !settings.hasSeenTutorial &&
     !showKeyboard && !actionMenu && !showHelp && !dragState && !testing;
-  // Gaze-anchored overlays that need the window expanded to the full gaze space.
-  const overlayOpen = widgetMode && (!!actionMenu || showKeyboard || showHelp || testing ||
-    reanchoring || settingsOpen || tutorialVisible);
+  // Full-screen "panel" experiences that momentarily need the whole window while
+  // tracking (settings, help, tutorial, accuracy test, re-anchor dot). These are
+  // deliberate — NOT per-click — so resizing the main window for them is fine.
+  // The action wheel and keyboard are NOT here: they're their own windows.
+  const bigPanel = widgetMode && (showHelp || testing || reanchoring || settingsOpen || tutorialVisible);
 
-  // --- Utility window shell: morph the real OS window between its shapes -----
-  // full (calibration/onboarding) ⇄ capsule HUD (tracking) ⇄ expanded (overlay).
-  // The gaze space is captured ONCE per widget entry, while the window still
-  // spans the calibrated screen, so gaze math survives the shrink.
+  // --- Window shell (all OPAQUE, explicit frames, no animated zoom) ----------
+  // Setup/panels → "full" (covers the display). Active tracking → "hud" (small
+  // opaque bottom-center HUD). Gaze-anchored surfaces (wheel/keyboard/ring) are
+  // their own windows, so the main window changes shape only on these deliberate
+  // transitions. The gaze space is captured once per widget entry (while the
+  // window still spans the calibrated screen) so gaze math survives the shrink.
   useEffect(() => {
     const seq = ++morphSeqRef.current;
     void (async () => {
       if (!widgetMode) {
         needCaptureRef.current = true;
         setMapping(null);
-        setExpanded(false);
         await setWindowMode("full");
         return;
       }
@@ -335,34 +360,50 @@ function Inner() {
         await captureGazeSpace();
         needCaptureRef.current = false;
       }
-      await setWindowMode(overlayOpen ? "expanded" : "capsule");
+      await setWindowMode(bigPanel ? "full" : "hud");
       if (morphSeqRef.current !== seq) return; // superseded by a newer morph
       setMapping(await getGazeMapping());
-      setExpanded(overlayOpen);
     })();
-  }, [widgetMode, overlayOpen]);
+  }, [widgetMode, bigPanel]);
 
-  // Click-through policy for the morphing window:
-  //  - capsule HUD: NOT click-through (its buttons take real mouse clicks; it's
-  //    tiny, so it can't shield the desktop).
-  //  - expanded overlay: click-through (a transparent full-screen window that
-  //    isn't click-through silently swallows every click and freezes the
-  //    desktop), re-asserted on an interval so it can never stick. The opaque
-  //    accuracy-test view is the exception — it must capture clicks.
+  // Body opacity: opaque everywhere now (no transparent full-screen shield). The
+  // HUD is a small opaque window; full-mode panels are deliberate foreground.
   useEffect(() => {
-    const on = widgetMode && overlayOpen && !testing;
-    void setClickThrough(on);
-    const t = window.setTimeout(() => void setClickThrough(on), 300);
-    if (!on) return () => window.clearTimeout(t);
-    const iv = window.setInterval(() => void setClickThrough(true), 1000);
-    const onFocus = () => void setClickThrough(true);
-    window.addEventListener("focus", onFocus);
-    return () => {
-      window.clearTimeout(t);
-      window.clearInterval(iv);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [widgetMode, overlayOpen, testing]);
+    document.body.classList.toggle("hud", widgetMode && !bigPanel);
+  }, [widgetMode, bigPanel]);
+
+  // Action wheel = its own window at the gaze point (never resizes this window —
+  // that per-click resize was the "slide to the corner" warp).
+  useEffect(() => {
+    if (actionMenu) void showOverlayAt("wheel", actionMenu.nx, actionMenu.ny);
+    else void hideOverlay("wheel");
+  }, [actionMenu]);
+
+  // The wheel window reports the chosen petal back here; dispatch the action.
+  useEffect(() => {
+    const un = listen<"left" | "right" | "double" | "drag" | "cancel">("wheel:select", (e) => {
+      const m = actionMenuRef.current;
+      const a = e.payload;
+      if (m && a !== "cancel") {
+        if (a === "drag") setDragState("arming");
+        else { dispatchAction(a, m.nx, m.ny); if (settings.soundOnClick) playClick(settings.soundVolume); }
+      }
+      setActionMenu(null);
+    });
+    return () => { void un.then((f) => f()); };
+  }, [settings.soundOnClick, settings.soundVolume]);
+
+  // Keyboard = its own bottom-docked window.
+  useEffect(() => {
+    if (showKeyboard) void showOverlayBottom("keyboard");
+    else void hideOverlay("keyboard");
+  }, [showKeyboard]);
+
+  // The keyboard window's ✕ reports back here.
+  useEffect(() => {
+    const un = listen("keyboard:close", () => { keyboardAutoRef.current = false; setShowKeyboard(false); });
+    return () => { void un.then((f) => f()); };
+  }, []);
 
   // Require a "Ready" press before each calibration run.
   useEffect(() => { if (state === "calibrating") setCalibReady(false); }, [state]);
@@ -443,17 +484,51 @@ function Inner() {
     return () => { void un.then((f) => f()); };
   }, [send]);
 
-  // Pipe calibration perf telemetry to the terminal (diagnosable lag reports).
+  // Pipe calibration perf telemetry to the terminal — only while Advanced
+  // Diagnostics is on, so normal use never fires this IPC.
   useEffect(() => {
+    if (!showDiag) return;
     const onPerf = (e: Event) => logPerf((e as CustomEvent<string>).detail);
     window.addEventListener("gaze:perf", onPerf as EventListener);
     return () => window.removeEventListener("gaze:perf", onPerf as EventListener);
-  }, []);
+  }, [showDiag]);
 
-  // ⌃⌥K — toggle the hands-free on-screen keyboard (only while tracking).
+  // Reflect the session state in the menu-bar item, so the app's status is
+  // legible at a glance without opening anything (native-utility behavior).
+  useEffect(() => {
+    const label =
+      state === "tracking" ? "● Tracking"
+      : state === "paused" ? "❙❙ Paused"
+      : state === "reacquiring" ? "◌ Reacquiring"
+      : state === "calibrating" ? "◎ Calibrating"
+      : "";
+    void setTrayStatus(label);
+  }, [state]);
+
+  // ⌃⌥K — toggle the hands-free on-screen keyboard (only while tracking). A
+  // manual toggle takes ownership away from the auto-keyboard logic.
   useEffect(() => {
     const un = listen("gaze:toggle-keyboard", () => {
-      if (stateRef.current === "tracking") setShowKeyboard((v) => !v);
+      if (stateRef.current === "tracking") { keyboardAutoRef.current = false; setShowKeyboard((v) => !v); }
+    });
+    return () => { void un.then((f) => f()); };
+  }, []);
+
+  // Auto-keyboard: a focused text field (in any app) raises the keyboard; the
+  // field blurring lowers it — but only if IT raised the keyboard, so a manually
+  // opened keyboard is never yanked away. We act on the CHANGE edges Rust emits,
+  // so once you close an auto keyboard it stays closed until the next field.
+  useEffect(() => {
+    const un = listen<boolean>("gaze:text-focus", (e) => {
+      if (e.payload) {
+        if (autoKbdRef.current && stateRef.current === "tracking" && armedRef.current) {
+          keyboardAutoRef.current = true;
+          setShowKeyboard(true);
+        }
+      } else if (keyboardAutoRef.current) {
+        keyboardAutoRef.current = false;
+        setShowKeyboard(false);
+      }
     });
     return () => { void un.then((f) => f()); };
   }, []);
@@ -598,8 +673,10 @@ function Inner() {
     return "Reacquiring your gaze…";
   })();
 
+  const hudMode = isWidget && !bigPanel;
   return (
-    <div style={{ position: "absolute", inset: 0, background: isWidget ? "transparent" : "var(--bg)" }}>
+    <div style={{ position: "absolute", inset: 0, background: "var(--bg)",
+      borderRadius: hudMode ? 20 : 0, overflow: "hidden" }}>
       {isWidget && (
         <DwellCursor active={isWidget && !testing} armed={armed && state === "tracking" && !testing}
           confidence={trackConf} onNativeClick={nativeClick}
@@ -616,6 +693,24 @@ function Inner() {
           mapping={mapping}
           onCalibrate={handleCalibrate} />
       )}
+      {/* Live camera feed inside the HUD — so the user always sees the tracker is
+          watching them. Only in the small HUD (full-mode panels own the screen). */}
+      {hudMode && settings.cameraPreview && camLive && (
+        <div style={{ position: "fixed", top: 40, left: "50%", transform: "translateX(-50%)",
+          width: 196, height: 110, borderRadius: 14, overflow: "hidden", zIndex: 60,
+          border: "1px solid var(--stroke)", boxShadow: "0 6px 20px rgba(0,0,0,0.28)",
+          background: "#000" }}>
+          <video ref={bindHudPreview} muted playsInline
+            style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)" }} />
+          <div style={{ position: "absolute", top: 6, left: 8, display: "flex", alignItems: "center", gap: 5,
+            fontSize: 10, fontWeight: 700, color: "#fff", textShadow: "0 1px 2px rgba(0,0,0,0.6)" }}>
+            <span style={{ width: 7, height: 7, borderRadius: 999,
+              background: state === "tracking" ? "#34d399" : "#fbbf24",
+              boxShadow: "0 0 6px currentColor" }} />
+            LIVE
+          </div>
+        </div>
+      )}
       {dragState && <DragBanner phase={dragState} />}
       {precision && !dragState && (
         <div style={{ position: "fixed", top: 44, left: "50%", transform: "translateX(-50%)", zIndex: 74,
@@ -625,31 +720,16 @@ function Inner() {
           ⊹ Precision mode — ⌃⌥Z to exit
         </div>
       )}
-      {testing && expanded && camLive && engineRef.current && cameraRef.current && (
+      {testing && camLive && engineRef.current && cameraRef.current && (
         <AccuracyTest engine={engineRef.current} video={cameraRef.current.video} onClose={() => setTesting(false)} />
       )}
       {showDriftNudge && state === "tracking" && !reanchoring && !dragState && (
         <DriftNudge onRecenter={startReanchor}
           onDismiss={() => { setShowDriftNudge(false); driftDismissedRef.current = performance.now() + DRIFT_DISMISS_MS; }} />
       )}
-      {showHelp && expanded && <HelpSheet onClose={() => setShowHelp(false)} />}
-      {tutorialVisible && expanded && (
+      {showHelp && <HelpSheet onClose={() => setShowHelp(false)} />}
+      {tutorialVisible && (
         <Tutorial onDone={() => settings.set({ hasSeenTutorial: true })} />
-      )}
-      {isWidget && showKeyboard && expanded && (
-        <OnScreenKeyboard onClose={() => setShowKeyboard(false)}
-          onKeyFeedback={() => { if (settings.soundOnClick) playClick(settings.soundVolume); }} />
-      )}
-      {actionMenu && expanded && (
-        <RadialMenu
-          center={{ x: actionMenu.nx * window.innerWidth, y: actionMenu.ny * window.innerHeight }}
-          onSelect={(action) => {
-            if (action === "drag") { setDragState("arming"); setActionMenu(null); return; }
-            dispatchAction(action, actionMenu.nx, actionMenu.ny);
-            if (settings.soundOnClick) playClick(settings.soundVolume);
-            setActionMenu(null);
-          }}
-          onCancel={() => setActionMenu(null)} />
       )}
       {isWidget && axTrusted === true && (
         <div style={{ position: "fixed", top: 8, left: "50%", transform: "translateX(-50%)",
@@ -660,7 +740,7 @@ function Inner() {
         </div>
       )}
       {isWidget && axTrusted === false && <AccessibilityBanner />}
-      {reanchoring && expanded && (
+      {reanchoring && (
         <div style={{ position: "fixed", inset: 0, zIndex: 80, pointerEvents: "none",
           display: "grid", placeItems: "center", gap: 14 }}>
           <div style={{ width: 22, height: 22, borderRadius: 999, background: "var(--accent, #3c82f6)",
@@ -746,7 +826,7 @@ function Inner() {
           onRecalibrate={() => send({ type: "START_RECALIBRATION", weakPointIds: [] })}
           onSettingsToggle={setSettingsOpen}
           settingsSlot={<SettingsPanel onToggleDiagnostics={() => setShowDiag((s) => !s)} showDiag={showDiag}
-            onShowKeyboard={() => setShowKeyboard(true)} onSwitchMonitor={switchMonitor}
+            onShowKeyboard={() => { keyboardAutoRef.current = false; setShowKeyboard(true); }} onSwitchMonitor={switchMonitor}
             onShowHelp={() => setShowHelp(true)}
             profiles={profiles} activeProfile={activeProfile}
             onSwitchProfile={switchProfile} onNewProfile={newProfile} onDeleteProfile={deleteProfile} />}
@@ -846,6 +926,7 @@ function SettingsPanel({ onToggleDiagnostics, showDiag, onShowKeyboard, onSwitch
       )}
 
       <SectionLabel>System</SectionLabel>
+      <Toggle label="Auto-show keyboard on text fields" checked={s.autoKeyboard} onChange={(v) => s.set({ autoKeyboard: v })} />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 0" }}>
         <span style={{ fontSize: 13.5 }}>On-screen keyboard</span>
         <button data-dwell onClick={onShowKeyboard}

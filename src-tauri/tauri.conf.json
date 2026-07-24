@@ -39,6 +39,40 @@
         "focus": false,
         "skipTaskbar": true,
         "visibleOnAllWorkspaces": true
+      },
+      {
+        "label": "wheel",
+        "title": "",
+        "width": 320,
+        "height": 320,
+        "x": 0,
+        "y": 0,
+        "visible": false,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "shadow": false,
+        "focus": false,
+        "skipTaskbar": true,
+        "visibleOnAllWorkspaces": true
+      },
+      {
+        "label": "keyboard",
+        "title": "",
+        "width": 900,
+        "height": 320,
+        "x": 0,
+        "y": 0,
+        "visible": false,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "shadow": false,
+        "focus": false,
+        "skipTaskbar": true,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {

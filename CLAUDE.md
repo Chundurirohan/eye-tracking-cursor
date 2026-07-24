@@ -72,8 +72,10 @@ Add or update tests — the core is pure and well-covered:
 
 ## Direction
 Backend/core correctness first, visual polish last. Keep it local-only and
-privacy-friendly. Next milestone: native system-wide cursor movement + clicks on
-macOS (will need Accessibility permission and a Rust-side input layer).
+privacy-friendly. Native system-wide cursor movement + clicks are **built**
+(CoreGraphics + Accessibility, see "HUD mode + separate windows"). Current
+milestone: the separate-windows HUD architecture (opaque HUD w/ live camera,
+ring/wheel/keyboard as their own windows) replacing the old transparent overlay.
 
 ## Calibration method (current)
 Static **dwell + robust fit** per grid point: show the dot, skip ~400ms saccade
@@ -86,23 +88,29 @@ robust to absolute-accuracy error. One bounded in-session **weak-point re-do**
 (`pointResidual > WEAK_RESIDUAL`) before finishing; the controller reports an
 empty weak list so the app never launches its own refit-from-subset pass.
 
-## Widget mode + dwell-click
-After calibration the app is a **transparent, borderless, always-on-top overlay**
-(Tauri `transparent`/`decorations:false`/`alwaysOnTop`/`macOSPrivateApi`; `body.widget`
-makes the web bg transparent). Only the camera feed, control bar, confidence bar,
-and gaze cursor paint. `DwellCursor` does dwell-to-click: resting gaze on a spot
-fills a ring and dispatches a real DOM click on the element under it (overlays it
-needs to click past must be `pointer-events:none`). Live confidence MUST exclude
-the `fit` factor (constant per frame) or tracking sticks on "reacquiring".
-System-wide clicking of OTHER apps still needs the native input layer
-(Accessibility + CGEvent) — not yet built.
+## HUD mode + separate windows (NOT a full-screen overlay)
+After calibration the app is NOT a transparent full-screen shield. It is a set of
+**small opaque native windows**, so the desktop is never covered and a click never
+resizes anything (the old full-screen overlay's per-click `maximize`/`zoom` was the
+"everything slides to the corner" warp — never reintroduce a window resize on the
+click path):
+- **main** → shrinks to a small **opaque HUD** (`setWindowMode("hud")`, explicit
+  physical frame in `lib.rs` — never `maximize`/`zoom`, which *animate* the frame).
+  The HUD shows the **live camera feed**, control capsule, and confidence bar.
+  `body.hud` + a rounded, opaque `#root` give it its capsule look. Deliberate
+  panels (settings/help/tutorial/accuracy/re-anchor = `bigPanel`) briefly go
+  `setWindowMode("full")`; the action wheel and keyboard are **not** panels.
+- **ring** → the dwell cursor ring, a tiny always-on-top window a Rust thread
+  (`spawn_ring_follower`) parks on the real OS cursor.
+- **wheel** → the action menu, its own window shown at the gaze point
+  (`show_overlay_at`). **keyboard** → the on-screen keyboard, docked bottom
+  (`show_overlay_bottom`).
 
-## Native input layer (gaze controls the OS)
-The widget overlay is **click-through** in tracking mode (`setClickThrough` →
-Tauri `setIgnoreCursorEvents(true)`), so the desktop is fully usable — a
-transparent window still captures clicks otherwise, which "freezes" the screen.
-Gaze drives the **real OS cursor** via CoreGraphics (`src-tauri` `warp_cursor`)
-and dwell injects **real clicks** (`mouse_click`) into any app. `DwellCursor`
-picks DOM `.click()` when a widget control is under the gaze, else a native OS
-click at the gaze point. **Requires macOS Accessibility permission** (System
-Settings › Privacy & Security › Accessibility) or synthetic clicks are ignored.
+`DwellCursor` (main) drives the **real OS cursor** via CoreGraphics
+(`src-tauri` `warp_cursor`) and dwell injects **real clicks** (`mouse_click`) into
+any app. Overlay windows can't see each other's DOM, so each runs its own local
+dwell (`useWindowDwell`) fed by gaze the main window broadcasts (`gaze:global` via
+`overlayBus`), and reports results back (`wheel:select` / `keyboard:close`). Live
+confidence MUST exclude the `fit` factor (constant per frame) or tracking sticks
+on "reacquiring". **Requires macOS Accessibility permission** (System Settings ›
+Privacy & Security › Accessibility) or synthetic clicks are ignored.

@@ -47,6 +47,9 @@ export interface SettingsData {
   idleAutoPause: boolean;
   idleTimeoutS: number;     // seconds with no face before auto-pausing
 
+  // --- Text entry ---
+  autoKeyboard: boolean;    // auto-show the on-screen keyboard on a focused text field
+
   // --- Onboarding ---
   hasSeenTutorial: boolean;
 }
@@ -87,6 +90,8 @@ export const DEFAULTS: SettingsData = {
 
   idleAutoPause: true,
   idleTimeoutS: 45,
+
+  autoKeyboard: true,
 
   hasSeenTutorial: false,
 };

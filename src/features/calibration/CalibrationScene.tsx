@@ -91,7 +91,8 @@ export function CalibrationScene({
       </div>
 
       {target && <Target x={target.x} y={target.y} label={PROMPT_COPY[target.variation]}
-        dwell={progress?.dwell ?? 0} collecting={!!progress?.settled} />}
+        dwell={progress?.dwell ?? 0} collecting={!!progress?.settled}
+        index={progress?.index ?? 0} total={progress?.total ?? 1} />}
       {moving && <MovingDot x={moving.x} y={moving.y} />}
       {moving && cursor && <GazeCursor x={cursor.x} y={cursor.y} following={!!progress?.inRange} />}
 
@@ -159,25 +160,36 @@ function FactorChip({ label, v }: { label: string; v: number }) {
   );
 }
 
-/** A single solid blue calibration dot — no ring. It shrinks from large to
- * small as the dwell window progresses (the shrink draws and holds the eye on
- * the point), and brightens while frames are actually being collected.
+/** A solid calibration dot — no ring. Each grid point gets its OWN color (hue
+ * rotated by point index, so every point is visibly distinct), which also makes
+ * progress legible at a glance. It shrinks from large to small as the dwell
+ * window progresses (the shrink draws and holds the eye on the point), and
+ * brightens while frames are actually being collected.
  *
  * Rendering discipline (the "blocky dot" post-mortem): the dwell shrink is a
  * per-frame update, so it animates via compositor-only `transform: scale()` on
  * a fixed-size dot — NEVER per-frame width/height (layout) changes. The eased
  * left/top transition is fine HERE because a static target's position changes
  * once per point (a discrete hop), not every frame. */
-function Target({ x, y, label, dwell, collecting }:
-  { x: number; y: number; label: string; dwell: number; collecting: boolean }) {
+function Target({ x, y, label, dwell, collecting, index, total }:
+  { x: number; y: number; label: string; dwell: number; collecting: boolean;
+    index: number; total: number }) {
   const scale = (34 - 16 * Math.min(1, Math.max(0, dwell))) / 34; // 1 -> ~0.53
+  // A WILD, distinct color per point — golden-angle hue steps so consecutive
+  // points jump far around the wheel (never a slow gradient), with jittered
+  // saturation/lightness so no two feel the same.
+  void total;
+  const hue = (index * 137.508) % 360;              // golden angle → maximally scattered
+  const sat = 72 + ((index * 47) % 26);             // 72–98%
+  const light = 52 + ((index * 29) % 16);           // 52–68%
+  const color = `hsl(${hue.toFixed(1)}, ${sat}%, ${light}%)`;
   return (
     <div style={{ position: "absolute", left: `${x * 100}%`, top: `${y * 100}%`,
       transform: "translate(-50%,-50%)", zIndex: 3,
       transition: "left var(--dur-med) var(--ease-soft), top var(--dur-med) var(--ease-soft)" }}>
-      <div style={{ width: 34, height: 34, borderRadius: 999, background: "var(--accent)",
+      <div style={{ width: 34, height: 34, borderRadius: 999, background: color,
         transform: `scale(${scale})`, willChange: "transform",
-        boxShadow: collecting ? "0 0 22px var(--accent)" : "0 0 12px var(--accent)",
+        boxShadow: collecting ? `0 0 22px ${color}` : `0 0 12px ${color}`,
         transition: "box-shadow var(--dur-fast)" }} />
       {label && <div style={{ position: "absolute", top: 34, left: "50%", transform: "translateX(-50%)",
         whiteSpace: "nowrap", fontSize: 13, color: "var(--text-2)" }}>{label}</div>}

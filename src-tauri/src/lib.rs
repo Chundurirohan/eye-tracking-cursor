@@ -57,22 +57,21 @@ fn capture_gaze_space(window: tauri::WebviewWindow, state: tauri::State<GazeSpac
     Ok(())
 }
 
-// Compact HUD capsule bounds (logical px). Sized to fit the control capsule
-// plus a slim banner row above it; positioned bottom-center of the gaze space.
-const CAPSULE_W: f64 = 640.0;
-const CAPSULE_H: f64 = 170.0;
+// Compact HUD window bounds (physical px are derived from these logical values
+// via the gaze-space scale). Bottom-center of the gaze space. The camera feed +
+// control bar live here; it never resizes during tracking.
+const HUD_W: f64 = 460.0;
+const HUD_H: f64 = 236.0;
 
-/// Morph the main window between its three utility shapes. Done in Rust so it
-/// isn't subject to the JS window ACL and happens as one atomic native call.
-///  - "full":     maximized (onboarding / calibration / settings scenes)
-///  - "capsule":  compact HUD, bottom-center of the gaze space
-///  - "expanded": exactly the gaze space (gaze-anchored overlays: wheel,
-///                keyboard, tutorial, re-anchor, accuracy test)
+/// Set the main window to one of its two OPAQUE shapes, using explicit frame
+/// geometry — NEVER macOS `zoom`/maximize, which animates the frame and made the
+/// whole app "slide to a corner" on interaction. Gaze-anchored surfaces live in
+/// their own separate windows (wheel/keyboard/ring), so the main window only
+/// changes shape on deliberate transitions, and does so instantly.
+///  - "full": cover the current display (onboarding / calibration / panels)
+///  - "hud":  compact HUD, bottom-center of the gaze space (active tracking)
 #[tauri::command]
 fn set_window_mode(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, mode: String) -> Result<(), String> {
-    // The follower ring only exists during active tracking. Hiding its window
-    // during calibration/onboarding removes a whole webview from compositing —
-    // GPU headroom that MediaPipe needs for a smooth calibration.
     let ring = window.app_handle().get_webview_window("ring");
     match mode.as_str() {
         "full" => {
@@ -80,46 +79,78 @@ fn set_window_mode(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>,
                 let _ = r.hide();
             }
             let _ = window.show();
-            // Guard: macOS zoom is a toggle — re-maximizing an already-maximized
-            // window would restore it instead.
-            if !window.is_maximized().unwrap_or(false) {
-                window.maximize().map_err(|e| format!("maximize: {e}"))?;
+            // Cover the display that currently hosts the window (physical px, no
+            // zoom animation).
+            if let Ok(Some(mon)) = window.current_monitor() {
+                let p = mon.position();
+                let s = mon.size();
+                window.set_position(tauri::PhysicalPosition::new(p.x, p.y)).map_err(|e| format!("set_position: {e}"))?;
+                window.set_size(tauri::PhysicalSize::new(s.width, s.height)).map_err(|e| format!("set_size: {e}"))?;
             }
             // Keep the (accessory-policy) app ACTIVE during calibration: WKWebView
             // throttles rAF in inactive apps, which visibly stutters the dot.
             let _ = window.set_focus();
             Ok(())
         }
-        "capsule" => {
+        "hud" => {
             if let Some(r) = &ring {
                 let _ = r.show();
             }
             let s = space_of(&window, &state)?;
-            let _ = window.unmaximize();
-            window
-                .set_size(tauri::LogicalSize::new(CAPSULE_W, CAPSULE_H))
-                .map_err(|e| format!("set_size: {e}"))?;
-            let x = (s.x + (s.w - CAPSULE_W * s.scale) / 2.0) / s.scale;
-            let y = (s.y + s.h) / s.scale - CAPSULE_H;
-            window
-                .set_position(tauri::LogicalPosition::new(x, y))
-                .map_err(|e| format!("set_position: {e}"))
-        }
-        "expanded" => {
-            if let Some(r) = &ring {
-                let _ = r.show();
-            }
-            let s = space_of(&window, &state)?;
-            let _ = window.unmaximize();
-            window
-                .set_size(tauri::LogicalSize::new(s.w / s.scale, s.h / s.scale))
-                .map_err(|e| format!("set_size: {e}"))?;
-            window
-                .set_position(tauri::LogicalPosition::new(s.x / s.scale, s.y / s.scale))
-                .map_err(|e| format!("set_position: {e}"))
+            // Physical bounds: bottom-center of the gaze space.
+            let w = HUD_W * s.scale;
+            let h = HUD_H * s.scale;
+            let x = s.x + (s.w - w) / 2.0;
+            let y = s.y + s.h - h - 16.0 * s.scale; // small gap from the bottom edge
+            window.set_size(tauri::PhysicalSize::new(w as u32, h as u32)).map_err(|e| format!("set_size: {e}"))?;
+            window.set_position(tauri::PhysicalPosition::new(x as i32, y as i32)).map_err(|e| format!("set_position: {e}"))?;
+            Ok(())
         }
         other => Err(format!("unknown window mode: {other}")),
     }
+}
+
+/// Show an overlay window (wheel/keyboard) centered on a gaze point (normalized
+/// to the gaze space), clamped on-screen. Positioned + shown — never resized.
+#[tauri::command]
+fn show_overlay_at(app: tauri::AppHandle, window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, label: String, nx: f64, ny: f64) -> Result<(), String> {
+    let s = space_of(&window, &state)?;
+    if let Some(w) = app.get_webview_window(&label) {
+        let size = w.outer_size().map_err(|e| format!("outer_size: {e}"))?;
+        let (ww, wh) = (size.width as f64, size.height as f64);
+        // Center on the gaze point (physical), clamp fully inside the gaze space.
+        let gx = s.x + nx * s.w;
+        let gy = s.y + ny * s.h;
+        let px = (gx - ww / 2.0).clamp(s.x, s.x + s.w - ww);
+        let py = (gy - wh / 2.0).clamp(s.y, s.y + s.h - wh);
+        w.set_position(tauri::PhysicalPosition::new(px as i32, py as i32)).map_err(|e| format!("set_position: {e}"))?;
+        w.show().map_err(|e| format!("show: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Show an overlay window docked to the bottom-center of the gaze space (keyboard).
+#[tauri::command]
+fn show_overlay_bottom(app: tauri::AppHandle, window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, label: String) -> Result<(), String> {
+    let s = space_of(&window, &state)?;
+    if let Some(w) = app.get_webview_window(&label) {
+        let size = w.outer_size().map_err(|e| format!("outer_size: {e}"))?;
+        let (ww, wh) = (size.width as f64, size.height as f64);
+        let px = s.x + (s.w - ww) / 2.0;
+        let py = s.y + s.h - wh - 12.0 * s.scale;
+        w.set_position(tauri::PhysicalPosition::new(px as i32, py as i32)).map_err(|e| format!("set_position: {e}"))?;
+        w.show().map_err(|e| format!("show: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Hide an overlay window.
+#[tauri::command]
+fn hide_overlay(app: tauri::AppHandle, label: String) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(&label) {
+        w.hide().map_err(|e| format!("hide: {e}"))?;
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -395,6 +426,38 @@ mod mac_ax {
         Some(s)
     }
 
+    /// Roles that represent an editable text-entry field. Covers native controls
+    /// and how web content (Safari/Chrome) exposes inputs via Accessibility.
+    fn is_text_role(role: &str) -> bool {
+        matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox" | "AXSearchField")
+    }
+
+    /// Whether the system-wide focused UI element is an editable text field —
+    /// the trigger for auto-showing the on-screen keyboard. Cheap enough to poll
+    /// a few times a second. Requires Accessibility (returns false without it).
+    pub unsafe fn focused_is_text() -> bool {
+        let sys = AXUIElementCreateSystemWide();
+        if sys.is_null() {
+            return false;
+        }
+        // Try the system-wide focused element directly; fall back through the
+        // focused application (some apps only expose it there).
+        let focused = copy_attr(sys, "AXFocusedUIElement").or_else(|| {
+            let app = copy_attr(sys, "AXFocusedApplication")?;
+            let f = copy_attr(app as AXUIElementRef, "AXFocusedUIElement");
+            CFRelease(app);
+            f
+        });
+        CFRelease(sys as CFTypeRef);
+        let el = match focused {
+            Some(e) => e as AXUIElementRef,
+            None => return false,
+        };
+        let is_text = ax_role(el).map(|r| is_text_role(&r)).unwrap_or(false);
+        CFRelease(el as CFTypeRef);
+        is_text
+    }
+
     unsafe fn ax_point(el: AXUIElementRef) -> Option<CGPoint> {
         let v = copy_attr(el, "AXPosition")?;
         let mut p = CGPoint { x: 0.0, y: 0.0 };
@@ -557,6 +620,25 @@ fn spawn_ring_follower(app: tauri::AppHandle) {
             last = (x, y);
             if let Some(ring) = app.get_webview_window("ring") {
                 let _ = ring.set_position(tauri::LogicalPosition::new(x - RING_HALF, y - RING_HALF));
+            }
+        }
+    });
+}
+
+/// Watch the system-wide focused element from a dedicated thread and emit
+/// `gaze:text-focus` (bool) whenever it changes between an editable text field
+/// and not — the signal the frontend uses to auto-show/hide the keyboard.
+#[cfg(target_os = "macos")]
+fn spawn_text_focus_watcher(app: tauri::AppHandle) {
+    use tauri::Emitter;
+    std::thread::spawn(move || {
+        let mut last = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let now = unsafe { mac_ax::focused_is_text() };
+            if now != last {
+                last = now;
+                let _ = app.emit("gaze:text-focus", now);
             }
         }
     });
@@ -762,6 +844,16 @@ fn log_perf(msg: String) {
     println!("[gaze-perf] {msg}");
 }
 
+/// Set the menu-bar status text next to the tray icon (empty = icon only).
+#[tauri::command]
+fn set_tray_status(app: tauri::AppHandle, text: String) -> Result<(), String> {
+    if let Some(tray) = app.tray_by_id("gaze-tray") {
+        let t = if text.is_empty() { None } else { Some(text) };
+        tray.set_title(t).map_err(|e| format!("set_title: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Open the macOS Accessibility settings pane directly, so the user can grant
 /// (or re-grant, after a rebuild invalidated it) permission in one tap.
 #[tauri::command]
@@ -907,6 +999,9 @@ pub fn run() {
             }
             #[cfg(target_os = "macos")]
             spawn_ring_follower(app.handle().clone());
+            // Watch for focused text fields to auto-raise the on-screen keyboard.
+            #[cfg(target_os = "macos")]
+            spawn_text_focus_watcher(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -933,7 +1028,11 @@ pub fn run() {
             capture_gaze_space,
             gaze_mapping,
             set_window_mode,
-            log_perf
+            show_overlay_at,
+            show_overlay_bottom,
+            hide_overlay,
+            log_perf,
+            set_tray_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
