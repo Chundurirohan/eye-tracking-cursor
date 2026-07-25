@@ -7,46 +7,24 @@ import { PermissionGate } from "@/features/permissions/PermissionGate";
 import { CalibrationScene } from "@/features/calibration/CalibrationScene";
 import { Capsule } from "@/features/tracking/Capsule";
 import { DwellCursor } from "@/features/tracking/DwellCursor";
-import { Tutorial } from "@/features/tracking/Tutorial";
 import { ReacquiringPill } from "@/features/tracking/ReacquiringPill";
 import { AdvancedView, type Diagnostics } from "@/features/diagnostics/AdvancedView";
-import { AccuracyTest } from "@/features/diagnostics/AccuracyTest";
+import { LandmarkOverlay } from "@/features/diagnostics/LandmarkOverlay";
 import { ConfidenceMeter } from "@/features/shared/ConfidenceMeter";
 import { Toggle } from "@/features/shared/Toggle";
-import { Slider } from "@/features/shared/Slider";
-import { Segmented } from "@/features/shared/Segmented";
-import { HelpSheet } from "@/features/shared/HelpSheet";
 import { useHotkeys } from "@/features/shared/useHotkeys";
-import { nativeClick, dispatchAction, isTrusted,
-  openAccessibilitySettings, requestAccessibility,
-  nativeDragStart, nativeDragEnd, moveToMonitor, listMonitors,
-  captureGazeSpace, getGazeMapping, setWindowMode, logPerf, setTrayStatus,
-  showOverlayAt, showOverlayBottom, hideOverlay, type GazeMapping } from "@/core/system/nativeInput";
-import { sendGazeGlobal } from "@/core/system/overlayBus";
+import { setClickThrough, nativeClick, dispatchAction, isTrusted } from "@/core/system/nativeInput";
+import { RadialMenu } from "@/features/tracking/RadialMenu";
+import { OnScreenKeyboard } from "@/features/tracking/OnScreenKeyboard";
 import { PoseAdaptiveCorrector } from "@/core/engine/adaptation";
 import { listen } from "@tauri-apps/api/event";
-import { useSettings, resolveDwell, type DwellPreset, type EmptyDwellAction, type ActivationMode } from "@/store/settings";
-import { playClick } from "@/core/system/sound";
+import { useSettings } from "@/store/settings";
 import { QUALITY_THRESHOLD } from "@/core/session/machine";
-import type { Profile } from "@/core/session/persistence";
 import "@/styles/global.css";
 
 // How many calibration passes (initial + weak-point refinements) before we
 // accept a best-effort result instead of looping forever.
 const MAX_CALIBRATION_ATTEMPTS = 3;
-
-// Blink-activation tuning. Eyes are "closed" below this openness; a deliberate
-// blink is an eyes-closed interval long enough to be intentional but short
-// enough not to read as resting the eyes.
-const BLINK_CLOSED = 0.18;
-const BLINK_MIN_MS = 200;
-const BLINK_MAX_MS = 900;
-const BLINK_COOLDOWN_MS = 700; // min gap between blink-triggered clicks (anti-double-fire)
-
-// Rolling click-vs-target drift (fraction of screen) above which we suggest a
-// quick re-center. Dismissing hides the nudge for this long.
-const DRIFT_NUDGE = 0.055;
-const DRIFT_DISMISS_MS = 60_000;
 
 function Inner() {
   const { state, context, send, saved, patchSaved, ready } = useSession();
@@ -60,55 +38,18 @@ function Inner() {
   // Gaze control of the OS cursor. Armed by default post-calibration (cursor is
   // joined to the gaze); ⌃⌥Space disarms → all control to mouse/trackpad, no fight.
   const [armed, setArmed] = useState(true);
-  const armedRef = useRef(armed);
-  armedRef.current = armed;
   // Radial action menu: the normalized gaze point where it's anchored, or null.
   const [actionMenu, setActionMenu] = useState<{ nx: number; ny: number } | null>(null);
+  const [showKeyboard, setShowKeyboard] = useState(false);
+  // Whether the keyboard is up because a text field auto-triggered it (vs. a
+  // manual toggle) — so auto-hide only reverses an auto-show, never fights the user.
+  const keyboardAutoRef = useRef(false);
   // Effective Accessibility permission (null = unknown yet). Synthetic clicks
   // no-op when false — this is the definitive shield-vs-permission diagnostic.
   const [axTrusted, setAxTrusted] = useState<boolean | null>(null);
   // A "Ready to calibrate" gate the user must press before calibration starts.
   const [calibReady, setCalibReady] = useState(false);
-  // Quick (3×3) vs full (5×5) calibration, chosen at the ready gate and kept
-  // stable across any weak-point refinement pass (so point ids line up).
-  const [calibMode, setCalibMode] = useState<"full" | "quick">("full");
   const calibAttemptsRef = useRef(0);
-  // Gaze drag gesture: null → idle, "arming" → next commit presses & holds,
-  // "dragging" → cursor emits drag events and next commit releases.
-  const [dragState, setDragState] = useState<null | "arming" | "dragging">(null);
-  const dragStateRef = useRef(dragState);
-  dragStateRef.current = dragState;
-  const [showKeyboard, setShowKeyboard] = useState(false);
-  // Whether the current keyboard showing was auto-triggered by a focused text
-  // field (vs. manually opened) — auto keyboards hide when the field blurs.
-  const keyboardAutoRef = useRef(false);
-  const [showHelp, setShowHelp] = useState(false);
-  const [precision, setPrecision] = useState(false); // fine-targeting mode
-  const [testing, setTesting] = useState(false);      // accuracy-test overlay
-  const blinkLastFireRef = useRef(0);                 // blink cooldown guard
-  // --- Utility window shell -------------------------------------------------
-  // Whether the settings popover is open (the HUD must grow to fit it).
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  // Gaze-space → window mapping for the current window shape (also lets the
-  // tracking loop convert gaze to global px for the overlay windows).
-  const [mapping, setMapping] = useState<GazeMapping | null>(null);
-  const mappingRef = useRef(mapping);
-  mappingRef.current = mapping;
-  const actionMenuRef = useRef(actionMenu);
-  actionMenuRef.current = actionMenu;
-  // Whether an overlay window (wheel/keyboard) is open and needs broadcast gaze.
-  const overlayWinOpenRef = useRef(false);
-  overlayWinOpenRef.current = !!actionMenu || showKeyboard;
-  const needCaptureRef = useRef(true); // capture gaze space on next widget entry
-  const morphSeqRef = useRef(0);       // ignore stale async morph completions
-  // Idle auto-pause: last time a face was seen + drift-safe settings copy.
-  const lastFaceRef = useRef(performance.now());
-  const idleRef = useRef({ auto: settings.idleAutoPause, timeoutS: settings.idleTimeoutS });
-  idleRef.current = { auto: settings.idleAutoPause, timeoutS: settings.idleTimeoutS };
-  // Rolling gaze-drift estimate (EMA of click-vs-target residuals) → "re-center?".
-  const driftEmaRef = useRef(0);
-  const driftDismissedRef = useRef(0);
-  const [showDriftNudge, setShowDriftNudge] = useState(false);
 
   const cameraRef = useRef<CameraManager | null>(null);
   const engineRef = useRef<IGazeEngine | null>(null);
@@ -121,15 +62,8 @@ function Inner() {
   const [reanchoring, setReanchoring] = useState(false);
   const headPoseRef = useRef<{ yaw: number; pitch: number } | null>(null);
   const previewRef = useRef<HTMLVideoElement>(null);
-  const hudPreviewRef = useRef<HTMLVideoElement | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
-  // Blink activation: current mode + timestamp the eyes went closed (0 = open).
-  const activationRef = useRef(settings.activationMode);
-  activationRef.current = settings.activationMode;
-  const autoKbdRef = useRef(settings.autoKeyboard);
-  autoKbdRef.current = settings.autoKeyboard;
-  const blinkClosedSinceRef = useRef(0);
 
   if (!cameraRef.current) cameraRef.current = new CameraManager();
   if (!engineRef.current) engineRef.current = new MediaPipeGazeEngine();
@@ -175,33 +109,24 @@ function Inner() {
   }, [send]);
 
   useEffect(() => {
+    const v = previewRef.current;
     const src = cameraRef.current!.video.srcObject;
-    for (const v of [previewRef.current, hudPreviewRef.current]) {
-      if (v && src && v.srcObject !== src) { v.srcObject = src; void v.play().catch(() => {}); }
-    }
+    if (v && src) { v.srcObject = src; void v.play().catch(() => {}); }
   }, [state, settings.cameraPreview, camLive]);
 
-  // Bind the live stream onto the HUD preview element the moment it mounts
-  // (it appears/disappears with the HUD, which this effect's deps don't track).
-  const bindHudPreview = useCallback((el: HTMLVideoElement | null) => {
-    hudPreviewRef.current = el;
-    const src = cameraRef.current?.video.srcObject;
-    if (el && src && el.srcObject !== src) { el.srcObject = src; void el.play().catch(() => {}); }
-  }, []);
-
   useEffect(() => {
-    // The accuracy test drives its own estimate loop; only one may run at a time
-    // (MediaPipe needs monotonic timestamps), so pause the tracking loop then.
-    if (testing || (state !== "tracking" && state !== "reacquiring")) {
+    // Keep the gaze loop running while PAUSED too — otherwise no gaze is fed and
+    // the Resume button can't be dwell-clicked (you'd be stuck paused). Paused
+    // just means DwellCursor is disarmed (no cursor warp / no clicks into apps);
+    // our own controls stay gaze-operable. State transitions below are guarded on
+    // stateRef, so the loop never auto-changes state while paused.
+    if (state !== "tracking" && state !== "reacquiring" && state !== "paused") {
       cancelAnimationFrame(rafRef.current);
       return;
     }
     const engine = engineRef.current!;
     const video = cameraRef.current!.video;
     let lastGood = performance.now();
-    let lastVideoTime = -1;
-    let lastInferAt = 0;
-    let lastUi = 0;
     let frames = 0, fpsT = performance.now(), fps = 0;
     const HOLD_MS = 160;
     // Gaze-stability confidence: how sure we are you're fixating a *point*.
@@ -211,37 +136,9 @@ function Inner() {
 
     const loop = () => {
       const now = performance.now();
-      // Spec §D: gate inference on the camera producing a new frame AND cap it
-      // at ~30/s — telemetry showed a 60fps camera driving 13ms inferences 60×/s
-      // (~80% of the main thread), the root cause of app-wide lag.
-      const vt = video.currentTime;
-      if (vt === lastVideoTime || now - lastInferAt < 30) { rafRef.current = requestAnimationFrame(loop); return; }
-      lastVideoTime = vt;
-      lastInferAt = now;
       const frame = engine.estimate(video, now);
       frames++;
       if (now - fpsT > 500) { fps = (frames * 1000) / (now - fpsT); frames = 0; fpsT = now; }
-
-      // Face-seen tracking for idle auto-pause.
-      if (frame.status !== "no_face") lastFaceRef.current = now;
-
-      // Blink / wink activation: a deliberate eyes-closed interval emits a
-      // trigger the DwellCursor turns into a click at the current gaze.
-      if (activationRef.current === "blink" && frame.eyeOpenness) {
-        const openMin = Math.min(frame.eyeOpenness.left, frame.eyeOpenness.right);
-        const closed = openMin < BLINK_CLOSED;
-        if (closed && !blinkClosedSinceRef.current) blinkClosedSinceRef.current = now;
-        else if (!closed && blinkClosedSinceRef.current) {
-          const dur = now - blinkClosedSinceRef.current;
-          blinkClosedSinceRef.current = 0;
-          if (dur >= BLINK_MIN_MS && dur <= BLINK_MAX_MS && now - blinkLastFireRef.current > BLINK_COOLDOWN_MS) {
-            blinkLastFireRef.current = now;
-            window.dispatchEvent(new CustomEvent("gaze:trigger"));
-          }
-        }
-      } else if (blinkClosedSinceRef.current) {
-        blinkClosedSinceRef.current = 0;
-      }
 
       // Gaze-stability confidence (how sure we are you're fixating a point) AND
       // damped-fixation stabilization (kills rest jitter without a deadband):
@@ -274,7 +171,6 @@ function Inner() {
             const avg = { x: s.reduce((a, q) => a + q.x, 0) / s.length, y: s.reduce((a, q) => a + q.y, 0) / s.length };
             adaptRef.current.reanchor(avg, { x: 0.5, y: 0.5 }, frame.headPose ?? null);
             reanchorRef.current = false; reanchorSamplesRef.current = [];
-            driftEmaRef.current = 0; setShowDriftNudge(false);
             setReanchoring(false);
           }
         }
@@ -284,17 +180,12 @@ function Inner() {
         headPoseRef.current = frame.headPose ?? null;
         const adapted = adaptRef.current.apply(out, frame.headPose ?? null);
         window.dispatchEvent(new CustomEvent("gaze:point", { detail: adapted }));
-        // Broadcast the gaze in global logical px to the overlay windows (wheel/
-        // keyboard) while one is open, so they can run their own local dwell.
-        if (overlayWinOpenRef.current && mappingRef.current) {
-          const m = mappingRef.current;
-          sendGazeGlobal((m.gsx + adapted.x * m.gsw) / m.scale, (m.gsy + adapted.y * m.gsh) / m.scale);
-        }
       } else {
         recent.length = 0;
       }
       if (frame.rawPoint) window.dispatchEvent(new CustomEvent("gaze:raw", { detail: frame.rawPoint }));
       emaConf += 0.2 * (gazeConf - emaConf);
+      setTrackConf(emaConf);
 
       const good = frame.status === "ok" && frame.confidence >= 0.45 && frame.point;
       if (good && frame.point) {
@@ -307,22 +198,15 @@ function Inner() {
         send({ type: "CONFIDENCE_LOST" });
       }
 
-      // Spec §D: per-frame confidence/diagnostics must NOT re-render the whole
-      // app tree — throttle these top-level state updates to ~10Hz. The
-      // gaze:point event above (which drives the cursor) still fires per frame.
-      if (now - lastUi > 90) {
-        lastUi = now;
-        setTrackConf(emaConf);
-        setDiag({
-          confidence: frame.confidence, factors: frame.factors, quality: context.quality, fps,
-          headPose: frame.headPose, engine: engine.capabilities.name,
-        });
-      }
+      setDiag({
+        confidence: frame.confidence, factors: frame.factors, quality: context.quality, fps,
+        headPose: frame.headPose, engine: engine.capabilities.name,
+      });
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [state, send, context.quality, testing]);
+  }, [state, send, context.quality]);
 
   useHotkeys(useMemo(() => ({
     onRecalibrate: () => send({ type: "START_RECALIBRATION", weakPointIds: [] }),
@@ -330,80 +214,33 @@ function Inner() {
     onToggleDiagnostics: () => setShowDiag((s) => !s),
   }), [send]));
 
+  // Make the OS window background transparent while in widget (post-calibration)
+  // mode, opaque otherwise (boot / permissions / calibration).
   const widgetMode = state === "tracking" || state === "paused" || state === "reacquiring";
-
-  // Whether the first-run tutorial wants the screen.
-  const tutorialVisible = state === "tracking" && !settings.hasSeenTutorial &&
-    !showKeyboard && !actionMenu && !showHelp && !dragState && !testing;
-  // Full-screen "panel" experiences that momentarily need the whole window while
-  // tracking (settings, help, tutorial, accuracy test, re-anchor dot). These are
-  // deliberate — NOT per-click — so resizing the main window for them is fine.
-  // The action wheel and keyboard are NOT here: they're their own windows.
-  const bigPanel = widgetMode && (showHelp || testing || reanchoring || settingsOpen || tutorialVisible);
-
-  // --- Window shell (all OPAQUE, explicit frames, no animated zoom) ----------
-  // Setup/panels → "full" (covers the display). Active tracking → "hud" (small
-  // opaque bottom-center HUD). Gaze-anchored surfaces (wheel/keyboard/ring) are
-  // their own windows, so the main window changes shape only on these deliberate
-  // transitions. The gaze space is captured once per widget entry (while the
-  // window still spans the calibrated screen) so gaze math survives the shrink.
   useEffect(() => {
-    const seq = ++morphSeqRef.current;
-    void (async () => {
-      if (!widgetMode) {
-        needCaptureRef.current = true;
-        setMapping(null);
-        await setWindowMode("full");
-        return;
-      }
-      if (needCaptureRef.current) {
-        await captureGazeSpace();
-        needCaptureRef.current = false;
-      }
-      await setWindowMode(bigPanel ? "full" : "hud");
-      if (morphSeqRef.current !== seq) return; // superseded by a newer morph
-      setMapping(await getGazeMapping());
-    })();
-  }, [widgetMode, bigPanel]);
+    document.body.classList.toggle("widget", widgetMode);
+    return () => document.body.classList.remove("widget");
+  }, [widgetMode]);
 
-  // Body opacity: opaque everywhere now (no transparent full-screen shield). The
-  // HUD is a small opaque window; full-mode panels are deliberate foreground.
+  // In widget mode let mouse input pass THROUGH the overlay so the computer is
+  // usable normally; capture it during setup/calibration so buttons are clickable.
+  // A transparent overlay that ISN'T click-through silently captures every click
+  // and "freezes" the desktop — so in widget mode we re-assert click-through on a
+  // steady interval, and re-assert whenever the window regains focus, so it can
+  // never get stuck in the blocking state.
   useEffect(() => {
-    document.body.classList.toggle("hud", widgetMode && !bigPanel);
-  }, [widgetMode, bigPanel]);
-
-  // Action wheel = its own window at the gaze point (never resizes this window —
-  // that per-click resize was the "slide to the corner" warp).
-  useEffect(() => {
-    if (actionMenu) void showOverlayAt("wheel", actionMenu.nx, actionMenu.ny);
-    else void hideOverlay("wheel");
-  }, [actionMenu]);
-
-  // The wheel window reports the chosen petal back here; dispatch the action.
-  useEffect(() => {
-    const un = listen<"left" | "right" | "double" | "drag" | "cancel">("wheel:select", (e) => {
-      const m = actionMenuRef.current;
-      const a = e.payload;
-      if (m && a !== "cancel") {
-        if (a === "drag") setDragState("arming");
-        else { dispatchAction(a, m.nx, m.ny); if (settings.soundOnClick) playClick(settings.soundVolume); }
-      }
-      setActionMenu(null);
-    });
-    return () => { void un.then((f) => f()); };
-  }, [settings.soundOnClick, settings.soundVolume]);
-
-  // Keyboard = its own bottom-docked window.
-  useEffect(() => {
-    if (showKeyboard) void showOverlayBottom("keyboard");
-    else void hideOverlay("keyboard");
-  }, [showKeyboard]);
-
-  // The keyboard window's ✕ reports back here.
-  useEffect(() => {
-    const un = listen("keyboard:close", () => { keyboardAutoRef.current = false; setShowKeyboard(false); });
-    return () => { void un.then((f) => f()); };
-  }, []);
+    void setClickThrough(widgetMode);
+    const t = window.setTimeout(() => void setClickThrough(widgetMode), 300);
+    if (!widgetMode) return () => window.clearTimeout(t);
+    const iv = window.setInterval(() => void setClickThrough(true), 1000);
+    const onFocus = () => void setClickThrough(true);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearTimeout(t);
+      window.clearInterval(iv);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [widgetMode]);
 
   // Require a "Ready" press before each calibration run.
   useEffect(() => { if (state === "calibrating") setCalibReady(false); }, [state]);
@@ -422,213 +259,29 @@ function Inner() {
     return () => { void un.then((f) => f()); };
   }, [send]);
 
-  // Quick re-anchor: look at the center dot ~1s to re-center the mapping for the
-  // current head posture (fixes accumulated drift without a full recalibration).
-  const startReanchor = useCallback(() => {
-    reanchorRef.current = true;
-    reanchorStartRef.current = performance.now();
-    reanchorSamplesRef.current = [];
-    setReanchoring(true);
-    setShowDriftNudge(false);
-  }, []);
-
-  // ⌃⌥R (global shortcut) triggers the same re-anchor.
+  // ⌃⌥R (global shortcut) — quick re-anchor: look at the center dot for ~1s to
+  // re-center the mapping for your current head posture (fixes accumulated drift
+  // without a full recalibration).
   useEffect(() => {
-    const un = listen("gaze:reanchor", () => startReanchor());
-    return () => { void un.then((f) => f()); };
-  }, [startReanchor]);
-
-  // Track click-vs-target drift and feed the self-healing corrector; when drift
-  // stays high, surface a gentle "re-center?" nudge.
-  const handleCalibrate = useCallback((gaze: { x: number; y: number }, target: { x: number; y: number }) => {
-    adaptRef.current.observe(gaze, target, headPoseRef.current);
-    const d = Math.hypot(target.x - gaze.x, target.y - gaze.y);
-    driftEmaRef.current = driftEmaRef.current === 0 ? d : driftEmaRef.current + 0.25 * (d - driftEmaRef.current);
-    if (driftEmaRef.current > DRIFT_NUDGE && performance.now() > driftDismissedRef.current)
-      setShowDriftNudge(true);
-  }, []);
-
-  // Idle auto-pause: if no face for the configured timeout while tracking, pause.
-  useEffect(() => {
-    const iv = window.setInterval(() => {
-      if (!idleRef.current.auto) return;
-      const s = stateRef.current;
-      if (s !== "tracking" && s !== "reacquiring") return;
-      if (performance.now() - lastFaceRef.current > idleRef.current.timeoutS * 1000)
-        send({ type: "PAUSE" });
-    }, 2000);
-    return () => window.clearInterval(iv);
-  }, [send]);
-
-  // ⌃⌥Return — "switch" click: emit a trigger the DwellCursor turns into a click
-  // at the current gaze (for switch activation mode / an external switch).
-  useEffect(() => {
-    const un = listen("gaze:switch-click", () => window.dispatchEvent(new CustomEvent("gaze:trigger")));
-    return () => { void un.then((f) => f()); };
-  }, []);
-
-  // Menu-bar "Recalibrate…" — Rust shows the window first, then emits this.
-  useEffect(() => {
-    const un = listen("gaze:recalibrate", () => {
-      setCalibReady(false);
-      send({ type: "START_RECALIBRATION", weakPointIds: [] });
-    });
-    return () => { void un.then((f) => f()); };
-  }, [send]);
-
-  // Closing (hiding) the main window force-pauses tracking: a hidden webview's
-  // RAF loop throttles to a halt, so gaze control would silently die otherwise.
-  // Explicit PAUSE keeps the state honest; reopen via the menu bar and resume.
-  useEffect(() => {
-    const un = listen("gaze:force-pause", () => send({ type: "PAUSE" }));
-    return () => { void un.then((f) => f()); };
-  }, [send]);
-
-  // Pipe calibration perf telemetry to the terminal — only while Advanced
-  // Diagnostics is on, so normal use never fires this IPC.
-  useEffect(() => {
-    if (!showDiag) return;
-    const onPerf = (e: Event) => logPerf((e as CustomEvent<string>).detail);
-    window.addEventListener("gaze:perf", onPerf as EventListener);
-    return () => window.removeEventListener("gaze:perf", onPerf as EventListener);
-  }, [showDiag]);
-
-  // Reflect the session state in the menu-bar item, so the app's status is
-  // legible at a glance without opening anything (native-utility behavior).
-  useEffect(() => {
-    const label =
-      state === "tracking" ? "● Tracking"
-      : state === "paused" ? "❙❙ Paused"
-      : state === "reacquiring" ? "◌ Reacquiring"
-      : state === "calibrating" ? "◎ Calibrating"
-      : "";
-    void setTrayStatus(label);
-  }, [state]);
-
-  // ⌃⌥K — toggle the hands-free on-screen keyboard (only while tracking). A
-  // manual toggle takes ownership away from the auto-keyboard logic.
-  useEffect(() => {
-    const un = listen("gaze:toggle-keyboard", () => {
-      if (stateRef.current === "tracking") { keyboardAutoRef.current = false; setShowKeyboard((v) => !v); }
+    const un = listen("gaze:reanchor", () => {
+      reanchorRef.current = true;
+      reanchorStartRef.current = performance.now();
+      reanchorSamplesRef.current = [];
+      setReanchoring(true);
     });
     return () => { void un.then((f) => f()); };
   }, []);
 
-  // Auto-keyboard: a focused text field (in any app) raises the keyboard; the
-  // field blurring lowers it — but only if IT raised the keyboard, so a manually
-  // opened keyboard is never yanked away. We act on the CHANGE edges Rust emits,
-  // so once you close an auto keyboard it stays closed until the next field.
+  // Auto-show the on-screen keyboard when a text field takes focus anywhere on
+  // the system (Rust AX watcher emits gaze:text-focus), and auto-hide when focus
+  // leaves — but never override a keyboard the user opened/closed by hand.
   useEffect(() => {
     const un = listen<boolean>("gaze:text-focus", (e) => {
-      if (e.payload) {
-        if (autoKbdRef.current && stateRef.current === "tracking" && armedRef.current) {
-          keyboardAutoRef.current = true;
-          setShowKeyboard(true);
-        }
-      } else if (keyboardAutoRef.current) {
-        keyboardAutoRef.current = false;
-        setShowKeyboard(false);
-      }
+      if (e.payload) { keyboardAutoRef.current = true; setShowKeyboard(true); }
+      else if (keyboardAutoRef.current) { keyboardAutoRef.current = false; setShowKeyboard(false); }
     });
     return () => { void un.then((f) => f()); };
   }, []);
-
-  // ⌃⌥Z — toggle precision (fine-targeting) mode.
-  useEffect(() => {
-    const un = listen("gaze:toggle-precision", () => setPrecision((v) => !v));
-    return () => { void un.then((f) => f()); };
-  }, []);
-
-  // ⌃⌥T — toggle the objective accuracy test (also the hands-free way to close
-  // it, since the dwell cursor is suspended while it drives its own loop).
-  useEffect(() => {
-    const un = listen("gaze:accuracy-test", () => {
-      const s = stateRef.current;
-      setTesting((t) => t ? false : (s === "tracking" || s === "paused" || s === "reacquiring"));
-    });
-    return () => { void un.then((f) => f()); };
-  }, []);
-
-  // Escape also closes the accuracy test.
-  useEffect(() => {
-    if (!testing) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setTesting(false); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [testing]);
-
-  // A gaze-drag can only run while actively tracking; cancel it if we leave.
-  useEffect(() => {
-    if (dragState && state !== "tracking") setDragState(null);
-  }, [state, dragState]);
-
-  // Gaze-drag step: first commit presses & holds; the next releases.
-  const handleDragCommit = useCallback((aim: { x: number; y: number }) => {
-    if (dragStateRef.current === "arming") { nativeDragStart(aim.x, aim.y); setDragState("dragging"); }
-    else if (dragStateRef.current === "dragging") { nativeDragEnd(aim.x, aim.y); setDragState(null); }
-  }, []);
-
-  // Move the overlay to another display, then recalibrate (mapping is screen-
-  // relative, so a different display needs a fresh calibration).
-  const switchMonitor = useCallback(async (index: number) => {
-    await moveToMonitor(index);
-    setCalibReady(false);
-    send({ type: "START_RECALIBRATION", weakPointIds: [] });
-  }, [send]);
-
-  // --- Calibration profiles -------------------------------------------------
-  const profiles: Profile[] = saved?.profiles
-    ?? (saved?.calibration ? [{ name: saved.activeProfile ?? "Default", calibration: saved.calibration }]
-      : [{ name: "Default", calibration: null }]);
-  const activeProfile = saved?.activeProfile ?? profiles[0]?.name ?? "Default";
-
-  // Migrate a pre-profiles session to a single "Default" profile, once.
-  useEffect(() => {
-    if (!ready || !saved || saved.profiles) return;
-    patchSaved({
-      profiles: saved.calibration ? [{ name: "Default", calibration: saved.calibration }] : [{ name: "Default", calibration: null }],
-      activeProfile: "Default",
-    });
-  }, [ready, saved]);
-
-  const applyEngineCalibration = useCallback((c: Profile["calibration"]) => {
-    if (!c || !engineRef.current) return;
-    engineRef.current.setCalibration(
-      c.anchors ? { wx: c.wx, wy: c.wy, residual: c.residual, anchors: c.anchors }
-        : { wx: c.wx, wy: c.wy, residual: c.residual });
-  }, []);
-
-  const switchProfile = useCallback((name: string) => {
-    const p = (saved?.profiles ?? profiles).find((x) => x.name === name);
-    if (!p || name === activeProfile) return;
-    adaptRef.current.reset();
-    calibAttemptsRef.current = 0;
-    patchSaved({ activeProfile: name, calibration: p.calibration });
-    if (p.calibration && p.calibration.quality >= QUALITY_THRESHOLD) {
-      applyEngineCalibration(p.calibration);
-      if (stateRef.current === "calibrating") send({ type: "CALIBRATION_COMPLETE", quality: p.calibration.quality });
-    } else {
-      setCalibReady(false);
-      send({ type: "START_RECALIBRATION", weakPointIds: [] });
-    }
-  }, [saved, profiles, activeProfile, patchSaved, send, applyEngineCalibration]);
-
-  const newProfile = useCallback(() => {
-    const list = saved?.profiles ?? profiles;
-    let n = list.length + 1, name = `Profile ${n}`;
-    while (list.some((p) => p.name === name)) { n++; name = `Profile ${n}`; }
-    adaptRef.current.reset();
-    calibAttemptsRef.current = 0;
-    patchSaved({ profiles: [...list, { name, calibration: null }], activeProfile: name, calibration: null });
-    setCalibReady(false);
-    send({ type: "START_RECALIBRATION", weakPointIds: [] });
-  }, [saved, profiles, patchSaved, send]);
-
-  const deleteProfile = useCallback((name: string) => {
-    const list = saved?.profiles ?? profiles;
-    if (list.length <= 1 || name === activeProfile) return;
-    patchSaved({ profiles: list.filter((p) => p.name !== name) });
-  }, [saved, profiles, activeProfile, patchSaved]);
 
   // Auto-dismiss the radial action menu if it's left untouched for a few seconds.
   useEffect(() => {
@@ -662,84 +315,33 @@ function Inner() {
   // After calibration the app becomes a transparent always-on-top widget overlay
   // rather than an opaque window.
   const isWidget = state === "tracking" || state === "paused" || state === "reacquiring";
-  const dwell = resolveDwell(settings);
-  // Actionable reason tracking was lost, from the latest confidence factors.
-  const reacquireReason = (() => {
-    const f = diag?.factors;
-    if (!f) return "Move back into the camera's view";
-    if (f.face < 0.6) return "Move closer / back into frame";
-    if (f.openness < 0.6) return "Open your eyes and look at the screen";
-    if (f.pose < 0.62) return "Face the screen — head upright";
-    return "Reacquiring your gaze…";
-  })();
 
-  const hudMode = isWidget && !bigPanel;
   return (
-    <div style={{ position: "absolute", inset: 0, background: "var(--bg)",
-      borderRadius: hudMode ? 20 : 0, overflow: "hidden" }}>
+    <div style={{ position: "absolute", inset: 0, background: isWidget ? "transparent" : "var(--bg)" }}>
       {isWidget && (
-        <DwellCursor active={isWidget && !testing} armed={armed && state === "tracking" && !testing}
+        <DwellCursor active={isWidget} armed={armed && state === "tracking"}
           confidence={trackConf} onNativeClick={nativeClick}
-          dwellMs={dwell.dwellMs} freeDwellMs={dwell.freeDwellMs} cooldownMs={settings.cooldownMs}
-          emptyDwellAction={settings.emptyDwellAction}
-          edgeScroll={settings.edgeScroll} scrollSpeed={settings.scrollSpeed}
-          snapStrength={settings.snapStrength} stabilityTolerance={settings.stabilityTolerance}
-          activationMode={settings.activationMode}
-          dragPhase={dragState} onDragCommit={handleDragCommit}
-          precision={precision}
-          onClickSound={() => { if (settings.soundOnClick) playClick(settings.soundVolume); }}
           menuOpen={!!actionMenu}
           onRequestMenu={(nx, ny) => setActionMenu({ nx, ny })}
-          mapping={mapping}
-          onCalibrate={handleCalibrate} />
+          onCalibrate={(gaze, target) => adaptRef.current.observe(gaze, target, headPoseRef.current)} />
       )}
-      {/* Live camera feed inside the HUD — so the user always sees the tracker is
-          watching them. Only in the small HUD (full-mode panels own the screen). */}
-      {hudMode && settings.cameraPreview && camLive && (
-        <div style={{ position: "fixed", top: 40, left: "50%", transform: "translateX(-50%)",
-          width: 196, height: 110, borderRadius: 14, overflow: "hidden", zIndex: 60,
-          border: "1px solid var(--stroke)", boxShadow: "0 6px 20px rgba(0,0,0,0.28)",
-          background: "#000" }}>
-          <video ref={bindHudPreview} muted playsInline
-            style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)" }} />
-          <div style={{ position: "absolute", top: 6, left: 8, display: "flex", alignItems: "center", gap: 5,
-            fontSize: 10, fontWeight: 700, color: "#fff", textShadow: "0 1px 2px rgba(0,0,0,0.6)" }}>
-            <span style={{ width: 7, height: 7, borderRadius: 999,
-              background: state === "tracking" ? "#34d399" : "#fbbf24",
-              boxShadow: "0 0 6px currentColor" }} />
-            LIVE
-          </div>
-        </div>
+      {actionMenu && (
+        <RadialMenu
+          center={{ x: actionMenu.nx * window.innerWidth, y: actionMenu.ny * window.innerHeight }}
+          onSelect={(action) => { dispatchAction(action, actionMenu.nx, actionMenu.ny); setActionMenu(null); }}
+          onCancel={() => setActionMenu(null)} />
       )}
-      {dragState && <DragBanner phase={dragState} />}
-      {precision && !dragState && (
-        <div style={{ position: "fixed", top: 44, left: "50%", transform: "translateX(-50%)", zIndex: 74,
-          pointerEvents: "none", fontSize: 12, fontWeight: 600, color: "#083344",
-          padding: "5px 14px", borderRadius: 999, backdropFilter: "blur(8px)",
-          background: "rgba(34,211,238,0.92)" }}>
-          ⊹ Precision mode — ⌃⌥Z to exit
-        </div>
+      {isWidget && showKeyboard && (
+        <OnScreenKeyboard onClose={() => { keyboardAutoRef.current = false; setShowKeyboard(false); }} />
       )}
-      {testing && camLive && engineRef.current && cameraRef.current && (
-        <AccuracyTest engine={engineRef.current} video={cameraRef.current.video} onClose={() => setTesting(false)} />
-      )}
-      {showDriftNudge && state === "tracking" && !reanchoring && !dragState && (
-        <DriftNudge onRecenter={startReanchor}
-          onDismiss={() => { setShowDriftNudge(false); driftDismissedRef.current = performance.now() + DRIFT_DISMISS_MS; }} />
-      )}
-      {showHelp && <HelpSheet onClose={() => setShowHelp(false)} />}
-      {tutorialVisible && (
-        <Tutorial onDone={() => settings.set({ hasSeenTutorial: true })} />
-      )}
-      {isWidget && axTrusted === true && (
+      {isWidget && axTrusted !== null && (
         <div style={{ position: "fixed", top: 8, left: "50%", transform: "translateX(-50%)",
           zIndex: 70, pointerEvents: "none", fontSize: 11, fontWeight: 600,
           padding: "3px 12px", borderRadius: 999, color: "#fff", backdropFilter: "blur(8px)",
-          background: "rgba(16,120,60,0.85)" }}>
-          Accessibility ✓ — clicks can land
+          background: axTrusted ? "rgba(16,120,60,0.85)" : "rgba(160,32,32,0.92)" }}>
+          {axTrusted ? "Accessibility ✓ — clicks can land" : "Accessibility ✗ — clicks will NOT land"}
         </div>
       )}
-      {isWidget && axTrusted === false && <AccessibilityBanner />}
       {reanchoring && (
         <div style={{ position: "fixed", inset: 0, zIndex: 80, pointerEvents: "none",
           display: "grid", placeItems: "center", gap: 14 }}>
@@ -753,15 +355,19 @@ function Inner() {
       )}
       {live && <ConfidenceMeter value={meterValue} />}
 
-      {/* Soft full-screen calibration backdrop only (no bottom-left mini feed).
-          NO blur filter: a full-screen live-video blur re-renders on the GPU
-          every frame — exactly the GPU headroom MediaPipe inference needs, and
-          a direct cause of a stuttering calibration dot. Dim opacity alone
-          keeps the soft look. */}
+      {/* Mini landmark camera only during live tracking — NOT during calibration
+          (the calibration scene is deliberately clean; head-position validation
+          lives in the ReadyGate before it starts). */}
+      {(state === "tracking" || state === "reacquiring") && camLive && engineRef.current && (
+        <LandmarkOverlay engine={engineRef.current} video={cameraRef.current!.video} />
+      )}
+
+      {/* Plain feed is only the soft calibration backdrop. During tracking the
+          single camera view is the landmark overlay (bottom-left). */}
       {settings.cameraPreview && state === "calibrating" && (
         <video ref={previewRef} muted playsInline
           style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover",
-            opacity: 0.16, transform: "scaleX(-1)",
+            opacity: 0.22, filter: "blur(2px)", transform: "scaleX(-1)",
             transition: "opacity var(--dur-slow) var(--ease-soft)" }} />
       )}
 
@@ -770,7 +376,7 @@ function Inner() {
       {state === "calibrating" && !calibReady && (
         <ReadyGate weak={context.weakPointIds.length > 0}
           engine={engineRef.current} video={cameraRef.current?.video ?? null} camLive={camLive}
-          onStart={(mode) => { if (context.weakPointIds.length === 0) setCalibMode(mode); setCalibReady(true); }} />
+          onStart={() => setCalibReady(true)} />
       )}
 
       {state === "calibrating" && calibReady && engineRef.current && (
@@ -779,15 +385,11 @@ function Inner() {
           video={cameraRef.current!.video}
           weakPointIds={context.weakPointIds}
           note={calibNote}
-          quick={calibMode === "quick"}
           onConfidence={setCalibConf}
           onComplete={(model, quality, weak) => {
             engineRef.current!.setCalibration(model);
-            const calib = { ...model, quality, savedAt: Date.now() };
             patchSaved({
-              calibration: calib,
-              profiles: (saved?.profiles ?? profiles).map((p) => p.name === activeProfile ? { ...p, calibration: calib } : p),
-              activeProfile,
+              calibration: { ...model, quality, savedAt: Date.now() },
               pauseOnStartup: settings.pauseOnStartup,
             });
             const attempt = ++calibAttemptsRef.current;
@@ -814,7 +416,7 @@ function Inner() {
         />
       )}
 
-      {state === "reacquiring" && <ReacquiringPill reason={reacquireReason} />}
+      {state === "reacquiring" && <ReacquiringPill />}
       {showDiag && diag && <AdvancedView d={diag} onClose={() => setShowDiag(false)} />}
 
       {showCapsule && (
@@ -824,118 +426,20 @@ function Inner() {
           armed={armed}
           onPauseToggle={() => send({ type: state === "paused" ? "RESUME" : "PAUSE" })}
           onRecalibrate={() => send({ type: "START_RECALIBRATION", weakPointIds: [] })}
-          onSettingsToggle={setSettingsOpen}
-          settingsSlot={<SettingsPanel onToggleDiagnostics={() => setShowDiag((s) => !s)} showDiag={showDiag}
-            onShowKeyboard={() => { keyboardAutoRef.current = false; setShowKeyboard(true); }} onSwitchMonitor={switchMonitor}
-            onShowHelp={() => setShowHelp(true)}
-            profiles={profiles} activeProfile={activeProfile}
-            onSwitchProfile={switchProfile} onNewProfile={newProfile} onDeleteProfile={deleteProfile} />}
+          keyboardOn={showKeyboard}
+          onToggleKeyboard={() => { keyboardAutoRef.current = false; setShowKeyboard((v) => !v); }}
+          settingsSlot={<SettingsPanel onToggleDiagnostics={() => setShowDiag((s) => !s)} showDiag={showDiag} />}
         />
       )}
     </div>
   );
 }
 
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <h4 style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.05em",
-      color: "var(--text-3)", margin: "var(--s-3) 0 2px" }}>{children}</h4>
-  );
-}
-
-function SettingsPanel({ onToggleDiagnostics, showDiag, onShowKeyboard, onSwitchMonitor, onShowHelp,
-  profiles, activeProfile, onSwitchProfile, onNewProfile, onDeleteProfile }:
-  { onToggleDiagnostics: () => void; showDiag: boolean; onShowKeyboard: () => void;
-    onSwitchMonitor: (index: number) => void; onShowHelp: () => void;
-    profiles: Profile[]; activeProfile: string;
-    onSwitchProfile: (name: string) => void; onNewProfile: () => void; onDeleteProfile: (name: string) => void }) {
+function SettingsPanel({ onToggleDiagnostics, showDiag }: { onToggleDiagnostics: () => void; showDiag: boolean }) {
   const s = useSettings();
   return (
-    <div style={{ maxHeight: "62vh", overflowY: "auto", paddingRight: 4 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "var(--s-1)" }}>
-        <h3 style={{ fontSize: 14 }}>Settings</h3>
-        <button data-dwell onClick={onShowHelp}
-          style={{ fontSize: 11.5, fontWeight: 600, padding: "3px 10px", borderRadius: 999,
-            background: "var(--accent-soft)", color: "var(--accent)" }}>? Help</button>
-      </div>
-
-      <SectionLabel>Profiles</SectionLabel>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "4px 0 2px" }}>
-        {profiles.map((p) => {
-          const active = p.name === activeProfile;
-          return (
-            <span key={p.name} style={{ display: "inline-flex", alignItems: "center", gap: 4,
-              padding: "4px 4px 4px 10px", borderRadius: 999, fontSize: 12, fontWeight: 600,
-              background: active ? "var(--accent)" : "var(--accent-soft)", color: active ? "#fff" : "var(--text-2)" }}>
-              <button data-dwell onClick={() => onSwitchProfile(p.name)}
-                style={{ color: "inherit", fontSize: 12, fontWeight: 600 }}>
-                {p.name}{p.calibration ? "" : " ·"}
-              </button>
-              {!active && profiles.length > 1 && (
-                <button data-dwell aria-label={`Delete ${p.name}`} onClick={() => onDeleteProfile(p.name)}
-                  style={{ width: 16, height: 16, borderRadius: 999, fontSize: 11, lineHeight: 1,
-                    background: "rgba(0,0,0,0.15)", color: "inherit" }}>✕</button>
-              )}
-            </span>
-          );
-        })}
-        <button data-dwell onClick={onNewProfile}
-          style={{ padding: "4px 10px", borderRadius: 999, fontSize: 12, fontWeight: 600,
-            background: "var(--accent-soft)", color: "var(--accent)" }}>+ New</button>
-      </div>
-
-      <SectionLabel>Activation</SectionLabel>
-      <Segmented<ActivationMode> label="Trigger" value={s.activationMode}
-        options={[{ value: "dwell", label: "Dwell" }, { value: "blink", label: "Blink" }, { value: "switch", label: "Switch" }]}
-        onChange={(v) => s.set({ activationMode: v })} />
-
-      <SectionLabel>Dwell timing</SectionLabel>
-      <Segmented<DwellPreset> label="Dwell speed" value={s.dwellPreset}
-        options={[{ value: "relaxed", label: "Relaxed" }, { value: "normal", label: "Normal" }, { value: "fast", label: "Fast" }, { value: "custom", label: "Custom" }]}
-        onChange={(v) => s.set({ dwellPreset: v })} />
-      {s.dwellPreset === "custom" && (
-        <>
-          <Slider label="Control dwell" value={s.dwellMs} min={400} max={2000} step={50}
-            onChange={(v) => s.set({ dwellMs: v })} format={(v) => `${v} ms`} />
-          <Slider label="Empty-space dwell" value={s.freeDwellMs} min={600} max={2600} step={50}
-            onChange={(v) => s.set({ freeDwellMs: v })} format={(v) => `${v} ms`} />
-        </>
-      )}
-      <Slider label="Click cooldown" value={s.cooldownMs} min={250} max={1500} step={50}
-        onChange={(v) => s.set({ cooldownMs: v })} format={(v) => `${v} ms`} />
-
-      <SectionLabel>Interaction</SectionLabel>
-      <Segmented<EmptyDwellAction> label="Empty-space dwell" value={s.emptyDwellAction}
-        options={[{ value: "click", label: "Click" }, { value: "menu", label: "Action wheel" }]}
-        onChange={(v) => s.set({ emptyDwellAction: v })} />
-      <Slider label="Stability tolerance" value={s.stabilityTolerance} min={0.5} max={2} step={0.1}
-        onChange={(v) => s.set({ stabilityTolerance: v })} format={(v) => `${v.toFixed(1)}×`} />
-      <Slider label="Magnetic snap" value={s.snapStrength} min={0} max={1.5} step={0.1}
-        onChange={(v) => s.set({ snapStrength: v })} format={(v) => (v === 0 ? "Off" : `${v.toFixed(1)}×`)} />
-
-      <SectionLabel>Scrolling &amp; sound</SectionLabel>
-      <Toggle label="Edge-gaze scrolling" checked={s.edgeScroll} onChange={(v) => s.set({ edgeScroll: v })} />
-      {s.edgeScroll && (
-        <Slider label="Scroll speed" value={s.scrollSpeed} min={0.25} max={2.5} step={0.25}
-          onChange={(v) => s.set({ scrollSpeed: v })} format={(v) => `${v.toFixed(2)}×`} />
-      )}
-      <Toggle label="Click sound" checked={s.soundOnClick} onChange={(v) => s.set({ soundOnClick: v })} />
-      {s.soundOnClick && (
-        <Slider label="Volume" value={s.soundVolume} min={0} max={1} step={0.1}
-          onChange={(v) => s.set({ soundVolume: v })} format={(v) => `${Math.round(v * 100)}%`} />
-      )}
-
-      <SectionLabel>System</SectionLabel>
-      <Toggle label="Auto-show keyboard on text fields" checked={s.autoKeyboard} onChange={(v) => s.set({ autoKeyboard: v })} />
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 0" }}>
-        <span style={{ fontSize: 13.5 }}>On-screen keyboard</span>
-        <button data-dwell onClick={onShowKeyboard}
-          style={{ padding: "5px 12px", borderRadius: 999, fontSize: 12, fontWeight: 600,
-            background: "var(--accent-soft)", color: "var(--accent)" }}>Open ⌃⌥K</button>
-      </div>
-      <MonitorPicker onSwitch={onSwitchMonitor} />
-
-      <SectionLabel>Display</SectionLabel>
+    <div>
+      <h3 style={{ fontSize: 14, marginBottom: "var(--s-2)" }}>Settings</h3>
       <Toggle label="Camera preview" checked={s.cameraPreview} onChange={(v) => s.set({ cameraPreview: v })} />
       <Toggle label="Pause on startup" checked={s.pauseOnStartup} onChange={(v) => s.set({ pauseOnStartup: v })} />
       <Toggle label="Auto-launch calibration" checked={s.autoLaunchCalibration} onChange={(v) => s.set({ autoLaunchCalibration: v })} />
@@ -957,94 +461,22 @@ function SettingsPanel({ onToggleDiagnostics, showDiag, onShowKeyboard, onSwitch
   );
 }
 
-/** Interactive prompt shown when synthetic clicks can't land because macOS
- * Accessibility permission is missing (commonly dropped after a rebuild). The
- * buttons open the settings pane and re-request the grant; both are dwell-
- * operable (data-dwell). */
-function AccessibilityBanner() {
-  const pill: React.CSSProperties = { padding: "5px 12px", borderRadius: 999, fontSize: 12, fontWeight: 600 };
-  return (
-    <div style={{ position: "fixed", top: 8, left: "50%", transform: "translateX(-50%)",
-      zIndex: 70, pointerEvents: "auto", display: "flex", alignItems: "center", gap: 10,
-      fontSize: 12, fontWeight: 600, color: "#fff", padding: "6px 8px 6px 14px",
-      borderRadius: 999, backdropFilter: "blur(8px)", background: "rgba(160,32,32,0.94)" }}>
-      <span>Accessibility off — clicks won't land</span>
-      <button data-dwell onClick={() => void openAccessibilitySettings()}
-        style={{ ...pill, background: "rgba(255,255,255,0.95)", color: "#7a1010" }}>Open settings</button>
-      <button data-dwell onClick={() => void requestAccessibility()}
-        style={{ ...pill, background: "rgba(255,255,255,0.25)", color: "#fff" }}>Re-request</button>
-    </div>
-  );
-}
-
-/** Gentle, dismissible prompt when gaze tracking appears to have drifted. */
-function DriftNudge({ onRecenter, onDismiss }: { onRecenter: () => void; onDismiss: () => void }) {
-  const pill: React.CSSProperties = { padding: "5px 12px", borderRadius: 999, fontSize: 12, fontWeight: 600 };
-  return (
-    <div style={{ position: "fixed", top: 44, left: "50%", transform: "translateX(-50%)", zIndex: 74,
-      display: "flex", alignItems: "center", gap: 10, pointerEvents: "auto", color: "#fff",
-      padding: "6px 8px 6px 14px", borderRadius: 999, backdropFilter: "blur(8px)",
-      background: "rgba(180,120,20,0.94)", fontSize: 12, fontWeight: 600 }}>
-      <span>Tracking may have drifted</span>
-      <button data-dwell onClick={onRecenter} style={{ ...pill, background: "rgba(255,255,255,0.95)", color: "#7a5210" }}>Re-center</button>
-      <button data-dwell onClick={onDismiss} style={{ ...pill, background: "rgba(255,255,255,0.22)", color: "#fff" }}>Dismiss</button>
-    </div>
-  );
-}
-
-/** Guidance while a gaze-drag gesture is in progress. */
-function DragBanner({ phase }: { phase: "arming" | "dragging" }) {
-  const msg = phase === "arming"
-    ? "Drag armed — dwell where the drag should START"
-    : "Dragging — dwell where to DROP (release)";
-  return (
-    <div style={{ position: "fixed", top: 44, left: "50%", transform: "translateX(-50%)",
-      zIndex: 75, pointerEvents: "none", fontSize: 12.5, fontWeight: 600, color: "#fff",
-      padding: "6px 16px", borderRadius: 999, backdropFilter: "blur(8px)",
-      background: "rgba(120,60,190,0.9)" }}>
-      ✥ {msg}
-    </div>
-  );
-}
-
-/** Display switcher — only rendered when more than one monitor is connected. */
-function MonitorPicker({ onSwitch }: { onSwitch: (index: number) => void }) {
-  const [monitors, setMonitors] = useState<string[]>([]);
-  useEffect(() => { void listMonitors().then(setMonitors); }, []);
-  if (monitors.length <= 1) return null;
-  return (
-    <div style={{ display: "flex", padding: "9px 0", alignItems: "center", justifyContent: "space-between",
-      gap: 10, flexWrap: "wrap" }}>
-      <span style={{ fontSize: 13.5 }}>Display <span className="dim" style={{ fontSize: 11 }}>(recalibrates)</span></span>
-      <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end" }}>
-        {monitors.map((m, i) => (
-          <button key={i} data-dwell onClick={() => onSwitch(i)}
-            style={{ padding: "4px 9px", borderRadius: 8, fontSize: 11.5, maxWidth: 120,
-              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-              background: "var(--accent-soft)", color: "var(--text-2)" }}>{m}</button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 const Boot = () => (
   <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center" }}>
     <div style={{ fontSize: 22, fontWeight: 600, letterSpacing: "-0.02em", opacity: 0.7 }}>Gaze</div>
   </div>
 );
 
-/** Gate shown before calibration starts. Runs a live detection loop to coach the
- * user into a good position (distance, centering, light, head pose) BEFORE any
- * samples are collected, and lets them pick a quick or full calibration. This
- * loop stops (unmounts) the instant the user presses start, so it never overlaps
- * the calibration loop. */
+/** Gate shown before calibration starts — nothing is collected until the user
+ * presses Start. It runs a LIVE head-position check (distance, centering, eyes,
+ * pose) and shows a position dot so the user can get settled and framed first —
+ * the single biggest lever on final calibration quality. */
 function ReadyGate({ weak, engine, video, camLive, onStart }: {
   weak: boolean;
   engine: IGazeEngine | null;
   video: HTMLVideoElement | null;
   camLive: boolean;
-  onStart: (mode: "full" | "quick") => void;
+  onStart: () => void;
 }) {
   const [pos, setPos] = useState<{ msg: string; tone: "wait" | "warn" | "good"; hx: number; hy: number; has: boolean }>(
     { msg: "Starting camera…", tone: "wait", hx: 0, hy: 0, has: false });
@@ -1056,7 +488,7 @@ function ReadyGate({ weak, engine, video, camLive, onStart }: {
     let lastInferAt = 0;
     const tick = () => {
       raf = requestAnimationFrame(tick);
-      // Inference only on new camera frames, capped at ~30/s (spec §D).
+      // Inference only on new camera frames, capped at ~30/s.
       const now = performance.now();
       const vt = video.currentTime;
       if (vt === lastVt || now - lastInferAt < 30) return;
@@ -1109,27 +541,11 @@ function ReadyGate({ weak, engine, video, camLive, onStart }: {
         <p className="dim" style={{ margin: "0 0 var(--s-5)", fontSize: 13, lineHeight: 1.5 }}>
           Sit about an arm's length away, evenly lit. When you start, follow each dot with your eyes.
         </p>
-
-        {weak ? (
-          <button onClick={() => onStart("full")}
-            style={{ padding: "12px 28px", borderRadius: "var(--radius-md)", background: "var(--accent)",
-              color: "#fff", fontSize: 15, fontWeight: 500 }}>
-            Start refinement
-          </button>
-        ) : (
-          <div style={{ display: "flex", justifyContent: "center", gap: 10 }}>
-            <button onClick={() => onStart("quick")}
-              style={{ padding: "12px 22px", borderRadius: "var(--radius-md)", background: "var(--accent-soft)",
-                color: "var(--accent)", fontSize: 14.5, fontWeight: 600 }}>
-              Quick (~20s)
-            </button>
-            <button onClick={() => onStart("full")}
-              style={{ padding: "12px 26px", borderRadius: "var(--radius-md)", background: "var(--accent)",
-                color: "#fff", fontSize: 14.5, fontWeight: 600 }}>
-              Full (best)
-            </button>
-          </div>
-        )}
+        <button onClick={onStart}
+          style={{ padding: "12px 28px", borderRadius: "var(--radius-md)", background: "var(--accent)",
+            color: "#fff", fontSize: 15, fontWeight: 500 }}>
+          {weak ? "Start refinement" : "Start calibration"}
+        </button>
       </div>
     </div>
   );

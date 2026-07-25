@@ -8,6 +8,9 @@ import { suggest } from "./predict";
 // string; Backspace / Return / Space use virtual keycodes.
 
 const KEY_DELETE = 51, KEY_RETURN = 36, KEY_SPACE = 49;
+// Keys dwell-activate faster than general targets — typing needs to be quick, and
+// the "don't re-fire the same key until you look away" guard prevents double-types.
+const KEY_DWELL_MS = 450;
 
 const LETTERS = [
   ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"],
@@ -38,10 +41,16 @@ export function OnScreenKeyboard({ onClose, onKeyFeedback }: {
     setSuggestions(suggest(w));
   };
 
+  // A local echo of what's been typed through the keyboard, shown in a bar on top
+  // so the user gets feedback without having to see the (often far-away) target
+  // field. Approximate: it mirrors keys pressed HERE, not the real field.
+  const [typed, setTyped] = useState("");
+
   const press = (fn: () => void) => { fn(); onKeyFeedback?.(); };
   const typeChar = (ch: string) => press(() => {
     const out = shift && !symbols ? ch.toUpperCase() : ch;
     typeText(out);
+    setTyped((t) => t + out);
     // Letters (and apostrophes) extend the current word; punctuation ends it.
     if (/[a-zA-Z']/.test(out)) setWord(wordRef.current + out);
     else setWord("");
@@ -49,26 +58,43 @@ export function OnScreenKeyboard({ onClose, onKeyFeedback }: {
   const acceptSuggestion = (w: string) => press(() => {
     // Type only the remainder plus a trailing space — the prefix is already in
     // the target field.
-    typeText(w.slice(wordRef.current.length) + " ");
+    const rest = w.slice(wordRef.current.length) + " ";
+    typeText(rest);
+    setTyped((t) => t + rest);
     setWord("");
   });
 
   return (
     <div style={{ position: "fixed", left: "50%", bottom: "calc(var(--s-5) + 64px)", transform: "translateX(-50%)",
-      zIndex: 88, width: "min(760px, 96vw)" }}>
-      <div className="glass" style={{ borderRadius: "var(--radius-lg)", padding: "10px 12px",
-        display: "flex", flexDirection: "column", gap: 6 }}>
+      zIndex: 88, width: "min(1240px, 99vw)" }}>
+      <div className="glass" style={{ borderRadius: "var(--radius-lg)", padding: "16px 18px",
+        display: "flex", flexDirection: "column", gap: 12 }}>
+        {/* Typed-text echo bar: shows what you've typed through the keyboard so
+            you don't need to watch the (often distant) target field. The tail is
+            kept visible (flex-end + overflow) so the caret is always in view. */}
+        <div style={{ display: "flex", alignItems: "center",
+          justifyContent: typed ? "flex-end" : "center", height: 58, padding: "0 20px",
+          borderRadius: 14, overflow: "hidden", background: "var(--accent-soft)",
+          border: "1px solid var(--stroke)" }}>
+          {typed ? (
+            <span style={{ whiteSpace: "pre", fontSize: 28, fontWeight: 500, color: "var(--text)" }}>
+              {typed}<span style={{ opacity: 0.5 }}>▏</span>
+            </span>
+          ) : (
+            <span style={{ fontSize: 18, color: "var(--text-3)" }}>Your typing appears here</span>
+          )}
+        </div>
         {/* Word-prediction chips: fixed-height row (no layout jump), each a
             dwell-friendly completion of the word being typed. */}
-        <div style={{ display: "flex", justifyContent: "center", gap: 8, height: 40 }}>
+        <div style={{ display: "flex", justifyContent: "center", gap: 12, height: 58 }}>
           {suggestions.length === 0 ? (
             <span style={{ alignSelf: "center", fontSize: 12, color: "var(--text-3)" }}>
               {wordRef.current ? "…" : "suggestions appear as you type"}
             </span>
           ) : (
             suggestions.map((w) => (
-              <button key={w} data-dwell onClick={() => acceptSuggestion(w)}
-                style={{ padding: "0 18px", borderRadius: 999, fontSize: 15, fontWeight: 600,
+              <button key={w} data-dwell data-dwell-ms={KEY_DWELL_MS} onClick={() => acceptSuggestion(w)}
+                style={{ padding: "0 30px", borderRadius: 999, fontSize: 23, fontWeight: 600,
                   background: "var(--accent-soft)", color: "var(--accent)",
                   border: "1px solid var(--stroke)" }}>
                 {/[A-Z]/.test(wordRef.current[0] ?? "") ? w[0]!.toUpperCase() + w.slice(1) : w}
@@ -77,7 +103,7 @@ export function OnScreenKeyboard({ onClose, onKeyFeedback }: {
           )}
         </div>
         {rows.map((row, ri) => (
-          <div key={ri} style={{ display: "flex", justifyContent: "center", gap: 6 }}>
+          <div key={ri} style={{ display: "flex", justifyContent: "center", gap: 8 }}>
             {ri === rows.length - 1 && !symbols && (
               <Key wide onClick={() => press(() => setShift((v) => !v))} active={shift}>⇧</Key>
             )}
@@ -85,14 +111,14 @@ export function OnScreenKeyboard({ onClose, onKeyFeedback }: {
               <Key key={ch} onClick={() => typeChar(ch)}>{shift && !symbols ? ch.toUpperCase() : ch}</Key>
             ))}
             {ri === rows.length - 1 && (
-              <Key wide onClick={() => press(() => { keyTap(KEY_DELETE); setWord(wordRef.current.slice(0, -1)); })}>⌫</Key>
+              <Key wide onClick={() => press(() => { keyTap(KEY_DELETE); setWord(wordRef.current.slice(0, -1)); setTyped((t) => t.slice(0, -1)); })}>⌫</Key>
             )}
           </div>
         ))}
-        <div style={{ display: "flex", justifyContent: "center", gap: 6 }}>
+        <div style={{ display: "flex", justifyContent: "center", gap: 8 }}>
           <Key wide onClick={() => press(() => setSymbols((v) => !v))} active={symbols}>{symbols ? "ABC" : "123"}</Key>
-          <Key grow onClick={() => press(() => { keyTap(KEY_SPACE); setWord(""); })}>space</Key>
-          <Key wide onClick={() => press(() => { keyTap(KEY_RETURN); setWord(""); })}>⏎</Key>
+          <Key grow onClick={() => press(() => { keyTap(KEY_SPACE); setWord(""); setTyped((t) => t + " "); })}>space</Key>
+          <Key wide onClick={() => press(() => { keyTap(KEY_RETURN); setWord(""); setTyped(""); })}>⏎</Key>
           <Key wide onClick={onClose}>✕</Key>
         </div>
       </div>
@@ -104,9 +130,9 @@ function Key({ children, onClick, wide, grow, active }: {
   children: React.ReactNode; onClick: () => void; wide?: boolean; grow?: boolean; active?: boolean;
 }) {
   return (
-    <button data-dwell onClick={onClick}
-      style={{ height: 46, minWidth: wide ? 64 : 40, flex: grow ? 1 : undefined,
-        padding: "0 10px", borderRadius: 10, fontSize: 16, fontWeight: 600,
+    <button data-dwell data-dwell-ms={KEY_DWELL_MS} onClick={onClick}
+      style={{ height: 82, minWidth: wide ? 116 : 74, flex: grow ? 1 : undefined,
+        padding: "0 16px", borderRadius: 14, fontSize: 28, fontWeight: 600,
         background: active ? "var(--accent)" : "var(--accent-soft)",
         color: active ? "#fff" : "var(--text)",
         border: "1px solid var(--stroke)" }}>

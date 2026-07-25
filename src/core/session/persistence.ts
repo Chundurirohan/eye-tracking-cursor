@@ -1,24 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { CalibrationModel } from "../calibration/types";
 
-export type SavedCalibration = (CalibrationModel & { quality: number; savedAt: number }) | null;
-
-/** A named calibration profile (e.g. "Glasses" vs "No glasses", or per person). */
-export interface Profile {
-  name: string;
-  calibration: SavedCalibration;
-}
-
 export interface PersistedSession {
   version: 1;
   permissionGranted: boolean;
   pauseOnStartup: boolean;
-  /** The ACTIVE profile's calibration — kept top-level so the resume logic
-   * (machine.ts) works unchanged. Mirrors `profiles[activeProfile]`. */
-  calibration: SavedCalibration;
-  /** Named profiles. Absent on sessions saved before profiles existed. */
-  profiles?: Profile[];
-  activeProfile?: string;
+  calibration: (CalibrationModel & { quality: number; savedAt: number }) | null;
 }
 
 const DEFAULT: PersistedSession = {

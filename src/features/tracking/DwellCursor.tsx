@@ -1,37 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 import { confidenceLook } from "@/features/shared/confidenceColor";
-import { warpCursor, snapTarget, nativeScroll, nativeDragTo, type GazeMapping } from "@/core/system/nativeInput";
-import { sendRingState, sendRingFlash } from "@/core/system/ringBus";
-import type { ActivationMode } from "@/store/settings";
-
-// Offset that converts a performance.now() timestamp to a Date.now() epoch —
-// stable for the session, so the ring window (a different JS context with a
-// different performance origin) can animate dwell fill deterministically.
-const EPOCH_OFFSET = Date.now() - performance.now();
+import { warpCursor, nativeTargets, nativeScroll } from "@/core/system/nativeInput";
 
 const DWELL_MS = 800;       // hold gaze on a registered clickable this long to act
 const FREE_DWELL_MS = 1500; // longer, deliberate dwell where NO clickable is detected
                             // (empty space) — cuts accidental activations
+const SNAP_VELOCITY = 1.2;  // normalized units/sec: above this the gaze is moving,
+                            // so snapping releases (no "gravity" while switching targets)
 const COOLDOWN_MS = 600;    // min gap between clicks
-// Fixation stability (spec §C): "settled" is judged by the SPREAD of gaze over a
-// short window — not instantaneous speed — because jitter has high frame-to-
-// frame speed but low net movement. This lets magnetic snapping engage THROUGH
-// jitter and release on a genuine saccade (which blows the spread up).
-const FIX_WINDOW_MS = 180;  // rolling fixation window
-const FIX_MIN_SAMPLES = 4;  // need this many samples before judging
-const FIX_SPREAD = 0.030;   // mean spread (normalized) below which gaze is settled
-// Sticky target lock: once a dwell is underway, keep the engaged target until
-// the gaze centroid clearly leaves it — clutter can't flip the target or reset
-// the ring from gaze noise.
-const STICKY_MARGIN = 0.04; // leave radius beyond the target's own bounds (normalized)
 const STALE_MS = 400;       // hide reticle if no gaze sample this recently
 const WARP_MS = 20;         // OS-cursor warp throttle
-const NATIVE_QUERY_MS = 110; // throttle for the async system-wide target lookup
-const NATIVE_FRESH_MS = 300; // how long a cached native-snap result stays usable
+// Render-rate smoothing of the VISIBLE cursor: each 60fps frame the reticle eases
+// toward its target by `SMOOTH_MIN + SMOOTH_GAIN·gap`. Small gaps (rest jitter)
+// ease slowly → smooth; large gaps (saccades) ramp to a full jump → still snappy.
+// This is the "smoothing delay" — the ease introduces a tiny, deliberate lag that
+// turns ~30fps steps into a smooth glide, WITHOUT the fragile timestamp buffer.
+// Clicks are unaffected (they warp to the true target point at fire time).
+const SMOOTH_MIN = 0.16;
+const SMOOTH_GAIN = 9;
 // Snap radius as a fraction of the smaller screen dimension: gaze only has to
 // land within this of a control to lock (magnetically) onto it. Kept modest so
 // the cursor doesn't yank to the bar from far away (which reads as "off").
-const SNAP_FRAC = 0.06;
+const SNAP_FRAC = 0.048;    // slightly weaker magnet: only captures when you're
+                           // clearly on a target, leaving reachable space between
+                           // targets (so an UNdetected control beside a detected
+                           // one isn't impossible to reach)
 const FREE_TOL = 0.06;      // free-space dwell jitter tolerance
 const FREE_LEAVE = 0.1;     // leave-to-rearm distance
 const ANCHOR_EMA = 0.1;
@@ -42,25 +35,87 @@ const SCROLL_BOTTOM: [number, number] = [0.89, 0.97]; // [min, max] normalized y
 const SCROLL_DELAY = 400;   // dwell in the band before scrolling starts
 const SCROLL_TICK_MS = 40;  // scroll cadence
 const SCROLL_STEP = 34;     // pixels per tick
-const SNAP_HYSTERESIS = 0.045; // keep the current native snap unless a new one is this far
+const STICKY_MARGIN = 1.35;    // once dwelling, keep the target until gaze leaves
+                               // its bounds by this × the snap radius (no jitter-flip)
 const SMALL_TARGET = 0.11;     // only auto-learn drift from targets smaller than this
                                // (normalized), where the gaze was genuinely on it
+const CONF_RADIUS_GAIN = 0.4;  // low confidence widens the snap radius by up to this
+const INTENT_BONUS = 0.4;      // a target dead-on your gaze trajectory reads up to
+                               // 40% "closer", so intent — not just proximity — wins
+const COMMIT_LOCK = 0.35;      // dwell progress past which the well pulls fully to
+                               // center (rock-steady while you commit the click)
 const CLICKABLE = 'button, a, [role="button"], input, [data-dwell]';
 
 type P = { x: number; y: number };
 
-/** Nearest clickable in THIS app within `limit` CSS px of window-local (px,py). */
-function nearestClickable(px: number, py: number, limit: number): HTMLElement | null {
-  let best: HTMLElement | null = null, bestD = limit;
+const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
+
+/** Nearest clickable in THIS app within `limit` px of (px,py), biased toward the
+ * one your gaze is MOVING toward (intent) so dense toolbars resolve the way you
+ * mean. `vx,vy` are the normalized gaze velocity components (0,0 = at rest). */
+function nearestClickable(px: number, py: number, limit: number, vx: number, vy: number): HTMLElement | null {
+  const vmag = Math.hypot(vx, vy);
+  let best: HTMLElement | null = null, bestScore = limit;
   document.querySelectorAll<HTMLElement>(CLICKABLE).forEach((el) => {
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return;
     const dx = Math.max(r.left - px, 0, px - r.right);
     const dy = Math.max(r.top - py, 0, py - r.bottom);
     const d = Math.hypot(dx, dy);
-    if (d < bestD) { bestD = d; best = el; }
+    if (d >= limit) return;
+    let score = d;
+    if (vmag > 0.15) {
+      // Cosine alignment of gaze motion with the direction to this target's center.
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      const dirx = cx - px, diry = cy - py;
+      const dmag = Math.hypot(dirx, diry) || 1;
+      const align = Math.max(0, (dirx * vx + diry * vy) / (dmag * vmag));
+      score = d * (1 - INTENT_BONUS * align);
+    }
+    if (score < bestScore) { bestScore = score; best = el; }
   });
   return best;
+}
+
+type NativeTarget = { x: number; y: number; w: number; h: number };
+
+/** Nearest system-wide clickable (from the scanner cache) within `limit`
+ * NORMALIZED units of (px,py), intent-biased toward gaze motion. All coords are
+ * normalized to window content. Returns the target (center + size) or null. */
+function nearestNativeTarget(px: number, py: number, limit: number, vx: number, vy: number, list: NativeTarget[]): NativeTarget | null {
+  const vmag = Math.hypot(vx, vy);
+  let best: NativeTarget | null = null, bestScore = limit;
+  for (const t of list) {
+    const dx = Math.max(Math.abs(px - t.x) - t.w / 2, 0);
+    const dy = Math.max(Math.abs(py - t.y) - t.h / 2, 0);
+    const d = Math.hypot(dx, dy);
+    if (d >= limit) continue;
+    let score = d;
+    if (vmag > 0.15) {
+      const dirx = t.x - px, diry = t.y - py;
+      const dmag = Math.hypot(dirx, diry) || 1;
+      const align = Math.max(0, (dirx * vx + diry * vy) / (dmag * vmag));
+      score = d * (1 - INTENT_BONUS * align);
+    }
+    if (score < bestScore) { bestScore = score; best = t; }
+  }
+  return best;
+}
+
+/** Continuous gravity-well pull of the reticle from `p` toward a target `center`
+ * — the same crisp magnet the HUD buttons use, applied everywhere. Within the
+ * firm INNER zone it locks fully onto center ("clicks into place"); through the
+ * outer band it eases in (never weaker than ~half), and low confidence pulls a
+ * bit harder. `commit` forces a full lock while a dwell is landing. */
+function gravityWell(p: P, center: P, radiusN: number, conf: number, commit: boolean): P {
+  if (commit) return center;
+  const d = Math.hypot(p.x - center.x, p.y - center.y);
+  const inner = radiusN * 0.4;
+  if (d <= inner) return center; // firm snap — sit right on the target like the HUD
+  const t = clamp01(1 - (d - inner) / (radiusN - inner));
+  const smooth = t * t * (3 - 2 * t);
+  const strength = clamp01((0.4 + 0.6 * smooth) * (1 + (1 - conf) * 0.3));
+  return { x: p.x + (center.x - p.x) * strength, y: p.y + (center.y - p.y) * strength };
 }
 
 /** Gaze reticle + dwell-to-click, with magnetic target snapping.
@@ -70,10 +125,7 @@ function nearestClickable(px: number, py: number, limit: number): HTMLElement | 
  * - When disarmed: the reticle still shows where you're looking, but the OS
  *   cursor is NOT touched (all control to the mouse/trackpad) and dwell is off.
  *   The reticle goes gray so you can see control is released. */
-export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibrate, menuOpen = false, onRequestMenu,
-  dwellMs = DWELL_MS, freeDwellMs = FREE_DWELL_MS, cooldownMs = COOLDOWN_MS,
-  emptyDwellAction = "menu", edgeScroll = true, scrollSpeed = 1, snapStrength = 1, stabilityTolerance = 1,
-  activationMode = "dwell", dragPhase = null, onDragCommit, precision = false, mapping = null, onClickSound }: {
+export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibrate, menuOpen = false, onRequestMenu }: {
   active: boolean; armed: boolean; confidence: number | null;
   onNativeClick?: (nx: number, ny: number) => void;
   /** Called on a confirmed click onto a known target center (gaze, target) —
@@ -83,43 +135,17 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
   menuOpen?: boolean;
   /** A free-space dwell requests the radial action menu at this normalized point. */
   onRequestMenu?: (nx: number, ny: number) => void;
-  /** Dwell/cooldown timing (ms). Default to the module constants. */
-  dwellMs?: number;
-  freeDwellMs?: number;
-  cooldownMs?: number;
-  /** What a dwell over empty space does: "click" left-clicks there, "menu" opens
-   *  the radial action wheel. Defaults to "menu" (v1.1 behavior). */
-  emptyDwellAction?: "click" | "menu";
-  /** Edge-gaze scrolling on/off and its speed multiplier. */
-  edgeScroll?: boolean;
-  scrollSpeed?: number;
-  /** Magnetic snap strength (0 = off) — scales the system-wide snap radius. */
-  snapStrength?: number;
-  /** Free-space dwell jitter tolerance multiplier (raise for tremor/fatigue). */
-  stabilityTolerance?: number;
-  /** How a click fires: dwell (hold), or blink/switch (external `gaze:trigger`). */
-  activationMode?: ActivationMode;
-  /** Gaze-drag gesture phase: null = idle, "arming" = next commit presses down,
-   *  "dragging" = cursor emits drag events and next commit releases. */
-  dragPhase?: null | "arming" | "dragging";
-  /** Called on a commit while a drag is armed/active, at the aim point. */
-  onDragCommit?: (aim: P) => void;
-  /** Precision (fine-targeting) mode: steadier cursor + longer dwell for small
-   *  targets. Off by default (crisp v1.1 behavior). */
-  precision?: boolean;
-  /** Gaze-space → window mapping, so gaze coordinates stay screen-absolute after
-   *  the window morphs into the HUD capsule. Null = window IS the gaze space. */
-  mapping?: GazeMapping | null;
-  /** Play the click-confirmation sound (already gated by settings by the app). */
-  onClickSound?: () => void;
 }) {
+  const [disp, setDisp] = useState<P | null>(null); // reticle position (may be snapped)
   const [progress, setProgress] = useState(0);
   const [rect, setRect] = useState<DOMRect | null>(null);
+  const [flash, setFlash] = useState(false);
+  const [ripple, setRipple] = useState<{ x: number; y: number; id: number } | null>(null);
 
   const posRef = useRef<P | null>(null);
+  const dispSmoothRef = useRef<P | null>(null); // eased visible-cursor position
   const lastGazeRef = useRef(0);
   const lastWarpRef = useRef(0);
-  const lastWarpPtRef = useRef<P | null>(null); // last point actually warped to
   const targetRef = useRef<HTMLElement | null>(null);
   const freeAnchorRef = useRef<P | null>(null);
   const dwellStartRef = useRef(0);
@@ -128,189 +154,143 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
   const armedPosRef = useRef<P | null>(null);
   const clickRef = useRef(onNativeClick);
   clickRef.current = onNativeClick;
+  const confRef = useRef(confidence);
+  confRef.current = confidence;
   const calibrateRef = useRef(onCalibrate);
   calibrateRef.current = onCalibrate;
   const requestMenuRef = useRef(onRequestMenu);
   requestMenuRef.current = onRequestMenu;
   const menuOpenRef = useRef(menuOpen);
   menuOpenRef.current = menuOpen;
-  // Live copy of the tuning props so the long-lived RAF loop reads the latest
-  // without re-subscribing (which would reset dwell timers on every change).
-  const cfgRef = useRef({ dwellMs, freeDwellMs, cooldownMs, emptyDwellAction, edgeScroll, scrollSpeed, snapStrength, stabilityTolerance, activationMode, dragPhase, precision });
-  cfgRef.current = { dwellMs, freeDwellMs, cooldownMs, emptyDwellAction, edgeScroll, scrollSpeed, snapStrength, stabilityTolerance, activationMode, dragPhase, precision };
-  const soundRef = useRef(onClickSound);
-  soundRef.current = onClickSound;
-  const dragCommitRef = useRef(onDragCommit);
-  dragCommitRef.current = onDragCommit;
-  const mappingRef = useRef(mapping);
-  mappingRef.current = mapping;
-  const confRef = useRef(confidence);
-  confRef.current = confidence;
-  const triggerRef = useRef(false); // external activation (blink / switch) pending
-  const renderRef = useRef<P | null>(null); // eased reticle/cursor position (precision mode)
-  const nativeRef = useRef<{ x: number; y: number; w: number; h: number; t: number } | null>(null); // cached system-wide snap
-  const nativeQueryRef = useRef(0);
-  const fixRef = useRef<{ x: number; y: number; t: number }[]>([]); // rolling fixation window
+  // System-wide clickables from the background scanner, refreshed a few times a
+  // second and hit-tested locally every frame (instant magnetism + boxes).
+  const nativeListRef = useRef<NativeTarget[]>([]);
+  const nativeHitRef = useRef<NativeTarget | null>(null); // current native hit (for box + drift-learn)
+  const lastPtRef = useRef<{ x: number; y: number; t: number } | null>(null); // for gaze speed
   const scrollDwellRef = useRef(0); // when gaze entered a scroll band
   const lastScrollRef = useRef(0);
   const progressRef = useRef(0); // live dwell progress, to lock the target mid-commit
 
   useEffect(() => {
     const onGaze = (e: Event) => { posRef.current = (e as CustomEvent<P>).detail; lastGazeRef.current = performance.now(); };
-    const onTrigger = () => { triggerRef.current = true; };
     window.addEventListener("gaze:point", onGaze as EventListener);
-    window.addEventListener("gaze:trigger", onTrigger);
-    return () => {
-      window.removeEventListener("gaze:point", onGaze as EventListener);
-      window.removeEventListener("gaze:trigger", onTrigger);
-    };
+    return () => window.removeEventListener("gaze:point", onGaze as EventListener);
   }, []);
 
+  // Poll the scanner cache into a local list (the scan itself runs on a Rust
+  // thread; this fetch is cheap and off the render path). The RAF loop then
+  // hit-tests this list synchronously every frame.
   useEffect(() => {
-    if (!active) {
-      setProgress(0); setRect(null);
-      sendRingState({ mode: "hidden", color: "#3c82f6" });
-      return;
-    }
-    let raf = 0;
-    const fire = (now: number) => {
-      lastClickRef.current = now; dwellStartRef.current = now; setProgress(0);
-      sendRingFlash();
-      soundRef.current?.();
+    if (!active) { nativeListRef.current = []; return; }
+    let alive = true;
+    const pull = async () => {
+      if (!alive) return;
+      nativeListRef.current = (await nativeTargets()).map(([x, y, w, h]) => ({ x, y, w, h }));
     };
-    /** Ring color for the current modifiers: drag > precision > confidence. */
-    const ringColor = () => {
-      const cfg = cfgRef.current;
-      if (cfg.dragPhase) return "#a855f7";
-      if (cfg.precision) return "#22d3ee";
-      return confidenceLook(confRef.current ?? 0).color;
+    void pull();
+    const id = window.setInterval(pull, 110);
+    return () => { alive = false; window.clearInterval(id); nativeListRef.current = []; };
+  }, [active]);
+
+  useEffect(() => {
+    if (!active) { setDisp(null); setProgress(0); setRect(null); return; }
+    let raf = 0;
+    const fire = (now: number, sx: number, sy: number) => {
+      lastClickRef.current = now; dwellStartRef.current = now; setProgress(0);
+      setFlash(true); setRipple({ x: sx, y: sy, id: now });
+      window.setTimeout(() => setFlash(false), 200);
     };
     const tick = () => {
       raf = requestAnimationFrame(tick);
       const now = performance.now();
-      const cfg = cfgRef.current;
-      const m = mappingRef.current;
-      // Gaze-space normalized ⇄ window-local CSS px. Without a mapping the
-      // window IS the gaze space (calibration / browser dev) — identity.
-      const toLocalX = (nx: number) => (m ? (m.gsx + nx * m.gsw - m.wx) / m.scale : nx * window.innerWidth);
-      const toLocalY = (ny: number) => (m ? (m.gsy + ny * m.gsh - m.wy) / m.scale : ny * window.innerHeight);
-      const toNormX = (lx: number) => (m ? (lx * m.scale + m.wx - m.gsx) / m.gsw : lx / window.innerWidth);
-      const toNormY = (ly: number) => (m ? (ly * m.scale + m.wy - m.gsy) / m.gsh : ly / window.innerHeight);
-      const domLimit = SNAP_FRAC * (m ? Math.min(m.gsw, m.gsh) / m.scale : Math.min(window.innerWidth, window.innerHeight));
       const p = posRef.current;
       if (!p || now - lastGazeRef.current > STALE_MS) {
-        setProgress(0); progressRef.current = 0; setRect(null); renderRef.current = null;
-        fixRef.current.length = 0;
-        sendRingState({ mode: "hidden", color: ringColor() });
-        return;
+        setDisp(null); setProgress(0); progressRef.current = 0; setRect(null);
+        dispSmoothRef.current = null; return;
       }
-      const px = toLocalX(p.x), py = toLocalY(p.y);
+      const px = p.x * window.innerWidth, py = p.y * window.innerHeight;
 
-      // Fixation stability: centroid + mean spread of gaze over a short window.
-      // "Settled" = holding a point (even a jittery hold); a real saccade blows
-      // the spread up and releases instantly.
-      const fw = fixRef.current;
-      fw.push({ x: p.x, y: p.y, t: now });
-      while (fw.length && now - fw[0]!.t > FIX_WINDOW_MS) fw.shift();
-      let cx = p.x, cy = p.y, spread = 1;
-      if (fw.length >= FIX_MIN_SAMPLES) {
-        cx = fw.reduce((s, q) => s + q.x, 0) / fw.length;
-        cy = fw.reduce((s, q) => s + q.y, 0) / fw.length;
-        spread = fw.reduce((s, q) => s + Math.hypot(q.x - cx, q.y - cy), 0) / fw.length;
+      // Gaze velocity (normalized units/sec) — computed up front so it feeds BOTH
+      // intent-biased target selection and the settle/release decision. While the
+      // eyes move between targets, snapping releases so the cursor isn't "stuck"
+      // being pulled back to a control when you try to leave.
+      let vx = 0, vy = 0, speed = 0;
+      if (lastPtRef.current) {
+        const dt = Math.max(1e-3, (now - lastPtRef.current.t) / 1000);
+        vx = (p.x - lastPtRef.current.x) / dt;
+        vy = (p.y - lastPtRef.current.y) / dt;
+        speed = Math.hypot(vx, vy);
       }
-      const settled = spread < FIX_SPREAD * Math.max(0.5, cfg.stabilityTolerance);
+      lastPtRef.current = { x: p.x, y: p.y, t: now };
+      const settling = speed < SNAP_VELOCITY;
 
-      // While dragging we treat everything as free movement so our own controls
-      // and app snaps don't hijack the drag.
-      const dragging = cfg.dragPhase !== null;
-      let target = dragging ? null : nearestClickable(px, py, domLimit);
+      // Confidence-scaled snap radius: when tracking is shaky, widen the catch so
+      // the UI structure compensates for the noisier signal.
+      const conf = clamp01(confRef.current ?? 0);
+      const radiusN = SNAP_FRAC * (1 + CONF_RADIUS_GAIN * (1 - conf)); // normalized snap radius
+      const radiusPx = radiusN * Math.min(window.innerWidth, window.innerHeight);
+      let target = nearestClickable(px, py, radiusPx, vx, vy);
 
-      // Sticky target lock: while a dwell is underway on one of our own controls,
-      // keep it engaged until the gaze CENTROID clearly leaves its bounds —
-      // neighboring controls can't steal it and jitter can't reset the ring.
-      const held = targetRef.current;
-      if (!dragging && held && held !== target && held.isConnected && progressRef.current > 0) {
-        const hr = held.getBoundingClientRect();
-        const hx = toNormX(hr.left + hr.width / 2), hy = toNormY(hr.top + hr.height / 2);
-        const halfDiag = Math.hypot(toNormX(hr.right) - toNormX(hr.left), toNormY(hr.bottom) - toNormY(hr.top)) / 2;
-        if (Math.hypot(cx - hx, cy - hy) < halfDiag + STICKY_MARGIN) target = held;
-      }
-      // System-wide snap radius scales with snapStrength (0 disables native snap,
-      // but our own controls always snap via nearestClickable above).
-      const nativeRadius = SNAP_FRAC * Math.max(0, cfg.snapStrength);
-
-      // System-wide magnetic snap: when no control of OUR app is near, throttled
-      // async lookup of the nearest clickable in ANY app (macOS Accessibility),
-      // cached across frames so the 60fps loop never blocks.
-      // Target lock: once a dwell has meaningfully committed, stop re-querying so
-      // the snap target can't switch under you from gaze noise ("which thing am I
-      // even clicking"). Resumes once the dwell resets (you look away).
-      if (armed && cfg.snapStrength > 0 && !dragging && !target && progressRef.current < 0.25 && now - nativeQueryRef.current > NATIVE_QUERY_MS) {
-        nativeQueryRef.current = now;
-        snapTarget(p.x, p.y, nativeRadius)
-          .then((r) => {
-            if (!r) { nativeRef.current = null; return; }
-            const prev = nativeRef.current;
-            // Hysteresis: in dense clusters the query flickers between adjacent
-            // targets. Keep the current snap unless the new one is clearly
-            // elsewhere, so it stops jittering between neighbors.
-            if (prev && performance.now() - prev.t < NATIVE_FRESH_MS &&
-                Math.hypot(r[0] - prev.x, r[1] - prev.y) < SNAP_HYSTERESIS) {
-              nativeRef.current = { x: prev.x, y: prev.y, w: prev.w, h: prev.h, t: performance.now() };
-            } else {
-              nativeRef.current = { x: r[0], y: r[1], w: r[2], h: r[3], t: performance.now() };
-            }
-          })
-          .catch(() => { nativeRef.current = null; });
-      }
-      let nativeSnap: P | null = null;
-      if (!target && cfg.snapStrength > 0 && !dragging) {
-        const nt = nativeRef.current;
-        // Dwell-stickiness: while a dwell on this snap target is underway, the
-        // cached target stays engaged even past its normal freshness — releasing
-        // mid-commit is what made small targets nearly unclickable.
-        const fresh = nt && (now - nt.t < NATIVE_FRESH_MS || progressRef.current > 0.2);
-        if (nt && fresh && Math.hypot(nt.x - cx, nt.y - cy) < nativeRadius * 3)
-          nativeSnap = { x: nt.x, y: nt.y };
-      }
-
-      // OS cursor position (spec §C fixation lock): once the gaze has settled,
-      // snap onto the engaged control's center — or, with nothing to snap to,
-      // PARK the cursor at the fixation centroid so it sits dead-still through
-      // jitter. While the eyes are genuinely moving, follow the live gaze so
-      // snapping releases the instant you look away.
-      let dispN = p;
-      if (settled && target) {
-        const r = target.getBoundingClientRect();
-        dispN = { x: toNormX(r.left + r.width / 2), y: toNormY(r.top + r.height / 2) };
-      } else if (settled && nativeSnap) {
-        dispN = nativeSnap;
-      } else if (settled) {
-        dispN = { x: cx, y: cy };
-      }
-      // Precision mode: ease the OS cursor toward the target for a steadier
-      // pointer on small elements. Default (non-precision) stays crisp/direct.
-      // Click/targeting always use the true gaze/target.
-      let out = dispN;
-      if (cfg.precision) {
-        const prev = renderRef.current ?? dispN;
-        out = { x: prev.x + 0.3 * (dispN.x - prev.x), y: prev.y + 0.3 * (dispN.y - prev.y) };
-        renderRef.current = out;
-      } else renderRef.current = null;
-
-      // Drive the real OS cursor only while armed (else the mouse owns it). While
-      // dragging, emit drag events so the underlying app updates its selection.
-      // Dedupe: a parked (fixation-locked or snapped) cursor doesn't re-warp to
-      // the same spot — the hot path goes fully quiet while you hold a point.
-      if (armed && now - lastWarpRef.current > WARP_MS) {
-        const lw = lastWarpPtRef.current;
-        if (!lw || Math.hypot(out.x - lw.x, out.y - lw.y) > 0.0012) {
-          if (cfg.dragPhase === "dragging") nativeDragTo(out.x, out.y);
-          else warpCursor(out.x, out.y);
-          lastWarpPtRef.current = { x: out.x, y: out.y };
-          lastWarpRef.current = now;
+      // Sticky commit: once a dwell has begun, keep the SAME target even if gaze
+      // jitter makes a neighbor momentarily nearest — only release when the gaze
+      // clearly leaves the committed target's bounds. Stops the "dwell keeps
+      // resetting between two adjacent buttons" problem.
+      const sticky = targetRef.current;
+      if (sticky && sticky !== target && progressRef.current > 0.12 && document.contains(sticky)) {
+        const r = sticky.getBoundingClientRect();
+        if (r.width > 0) {
+          const dx = Math.max(r.left - px, 0, px - r.right);
+          const dy = Math.max(r.top - py, 0, py - r.bottom);
+          if (Math.hypot(dx, dy) < radiusPx * STICKY_MARGIN) target = sticky;
         }
       }
+
+      // System-wide magnetic snap: when no control of OUR app is near, hit-test
+      // the scanner's cached clickables LOCALLY (instant — no async wait), so
+      // targets and their boxes appear the moment you look, just like the HUD.
+      // Locked once a dwell has committed so gaze noise can't switch the target.
+      let nativeSnap: P | null = null;
+      if (armed && !target) {
+        // Sticky commit for system-wide targets too: keep the current hit while a
+        // dwell is underway and the gaze is still within its bounds + margin.
+        const cur = nativeHitRef.current;
+        let keep = false;
+        if (cur && progressRef.current > 0.12) {
+          const dx = Math.max(Math.abs(p.x - cur.x) - cur.w / 2, 0);
+          const dy = Math.max(Math.abs(p.y - cur.y) - cur.h / 2, 0);
+          if (Math.hypot(dx, dy) < radiusN * STICKY_MARGIN) keep = true;
+        }
+        const hit = keep ? cur : nearestNativeTarget(p.x, p.y, radiusN, vx, vy, nativeListRef.current);
+        nativeHitRef.current = hit;
+        if (hit) nativeSnap = { x: hit.x, y: hit.y };
+      } else {
+        nativeHitRef.current = null;
+      }
+
+      // Reticle + OS cursor position: a magnetic GRAVITY WELL toward a nearby
+      // control's center — continuous (pulls harder the closer you are), released
+      // the instant the gaze moves, and pulled fully to center once a dwell starts
+      // to commit (so the click is rock-steady). Clicks on OUR controls fire via
+      // target.click() regardless of the reticle; native clicks aim at the center.
+      let dispN = p;
+      if (settling && target) {
+        const r = target.getBoundingClientRect();
+        const center = { x: (r.left + r.width / 2) / window.innerWidth, y: (r.top + r.height / 2) / window.innerHeight };
+        dispN = gravityWell(p, center, radiusN, conf, progressRef.current > COMMIT_LOCK);
+      } else if (settling && nativeSnap) {
+        dispN = gravityWell(p, nativeSnap, radiusN, conf, progressRef.current > COMMIT_LOCK);
+      }
+      // Adaptive render smoothing: ease the visible cursor toward dispN — smooth
+      // on small moves, snappy on saccades. This is the smoothing "delay".
+      const prevS = dispSmoothRef.current ?? dispN;
+      const gap = Math.hypot(dispN.x - prevS.x, dispN.y - prevS.y);
+      const a = Math.min(1, SMOOTH_MIN + SMOOTH_GAIN * gap);
+      const sm = { x: prevS.x + a * (dispN.x - prevS.x), y: prevS.y + a * (dispN.y - prevS.y) };
+      dispSmoothRef.current = sm;
+      setDisp(sm);
+
+      // Drive the real OS cursor only while armed (else the mouse owns it).
+      if (armed && now - lastWarpRef.current > WARP_MS) { warpCursor(sm.x, sm.y); lastWarpRef.current = now; }
 
       // Clear re-arm guards once the gaze has moved on.
       if (armedElRef.current && target !== armedElRef.current) armedElRef.current = null;
@@ -320,106 +300,79 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
       // click into other apps — but STILL allow dwell on OUR OWN controls, so
       // the control bar (incl. Resume) is always gaze-operable and pausing can
       // never deadlock the app.
-      if (!armed && !target) {
-        setRect(null); setProgress(0); targetRef.current = null; freeAnchorRef.current = null;
-        sendRingState({ mode: "hidden", color: ringColor() });
-        return;
-      }
+      if (!armed && !target) { setRect(null); setProgress(0); targetRef.current = null; freeAnchorRef.current = null; return; }
 
       // Edge-gaze scrolling / hands-free reading: hold gaze in the top/bottom
       // band (over empty space) to scroll the page. A short delay before it
       // starts prevents accidental scroll from a glance.
       const inTop = p.y > SCROLL_TOP[0] && p.y < SCROLL_TOP[1];
       const inBottom = p.y > SCROLL_BOTTOM[0] && p.y < SCROLL_BOTTOM[1];
-      if (armed && cfg.edgeScroll && !target && !nativeSnap && (inTop || inBottom)) {
+      if (armed && !target && !nativeSnap && (inTop || inBottom)) {
         if (!scrollDwellRef.current) scrollDwellRef.current = now;
         setRect(null); setProgress(0); progressRef.current = 0; targetRef.current = null; freeAnchorRef.current = null;
         if (now - scrollDwellRef.current > SCROLL_DELAY && now - lastScrollRef.current > SCROLL_TICK_MS) {
           lastScrollRef.current = now;
-          const step = SCROLL_STEP * Math.max(0.25, cfg.scrollSpeed);
-          nativeScroll(inBottom ? -step : step);
+          nativeScroll(inBottom ? -SCROLL_STEP : SCROLL_STEP);
         }
-        sendRingState({ mode: "active", color: ringColor() });
         return;
       }
       scrollDwellRef.current = 0;
 
-      const canClick = now - lastClickRef.current > cfg.cooldownMs;
-      const precMul = cfg.precision ? 1.5 : 1; // longer dwell / steadier hold when precise
-      // In blink/switch modes a click fires on an external `gaze:trigger` instead
-      // of a completed dwell. Clear stale triggers in dwell mode so a later mode
-      // switch can't fire an old one.
-      const externalMode = cfg.activationMode !== "dwell";
-      if (!externalMode) triggerRef.current = false;
-      const triggered = externalMode && triggerRef.current;
-      if (triggered) triggerRef.current = false;
-
-      // Emit ring state for the follower window: dwell (fill animating from a
-      // shared-epoch start) when a hold is in progress, else active. The bus
-      // dedupes, so only real changes cross the window boundary. A hold must be
-      // ~120ms old before it counts — otherwise gaze scanning (which resets the
-      // free anchor almost every frame) would emit a new start per frame.
-      const emitRing = (dwellDurationMs: number | null) => {
-        if (dwellDurationMs != null && now - dwellStartRef.current < 120) dwellDurationMs = null;
-        if (dwellDurationMs != null) {
-          sendRingState({
-            mode: "dwell",
-            start: dwellStartRef.current + EPOCH_OFFSET,
-            durationMs: dwellDurationMs,
-            color: ringColor(),
-          });
-        } else {
-          sendRingState({ mode: "active", color: ringColor() });
-        }
-      };
+      const canClick = now - lastClickRef.current > COOLDOWN_MS;
 
       if (target) {
         freeAnchorRef.current = null;
         const r = target.getBoundingClientRect();
         setRect(r);
         if (target !== targetRef.current) { targetRef.current = target; dwellStartRef.current = now; }
-        if (target === armedElRef.current) { setProgress(0); progressRef.current = 0; emitRing(null); return; }
-        const dwellNeeded = cfg.dwellMs * precMul;
-        const prog = Math.min(1, (now - dwellStartRef.current) / dwellNeeded);
+        if (target === armedElRef.current) { setProgress(0); progressRef.current = 0; return; }
+        // Per-element dwell override (e.g. keyboard keys dwell faster). The
+        // armedEl guard above already blocks re-firing the SAME key until you look
+        // away, so a short dwell can't double-type.
+        const dwellMs = Number(target.dataset.dwellMs) || DWELL_MS;
+        const prog = Math.min(1, (now - dwellStartRef.current) / dwellMs);
         setProgress(prog); progressRef.current = prog;
-        emitRing(externalMode ? null : dwellNeeded);
-        if ((externalMode ? triggered : prog >= 1) && canClick) {
+        if (prog >= 1 && canClick) {
           target.click(); armedElRef.current = target; armedPosRef.current = null;
-          if (armed) calibrateRef.current?.({ x: cx, y: cy }, dispN); // dispN = DOM target center
-          fire(now);
+          if (armed) calibrateRef.current?.(p, dispN); // dispN = DOM target center
+          fire(now, r.left + r.width / 2, r.top + r.height / 2);
         }
       } else {
-        targetRef.current = null; setRect(null);
-        // Click lands at the snap target, else the FIXATION CENTROID (not the
-        // instantaneous sample) — the click goes where you're holding, not where
-        // the last jittery frame happened to land.
-        const aim = nativeSnap ?? (settled ? { x: cx, y: cy } : p);
+        targetRef.current = null;
+        // Highlight box for a system-wide clickable (other app), identical to the
+        // box drawn on our own HUD controls — so "on something clickable → box,
+        // on empty space → just the reticle" holds EVERYWHERE. Skip absurdly large
+        // hits (containers, not buttons); the reticle carries those.
+        const nt = nativeHitRef.current;
+        if (nativeSnap && nt && nt.w < 0.6 && nt.h < 0.6) {
+          const rw = nt.w * window.innerWidth, rh = nt.h * window.innerHeight;
+          setRect(new DOMRect(nt.x * window.innerWidth - rw / 2, nt.y * window.innerHeight - rh / 2, rw, rh));
+        } else {
+          setRect(null);
+        }
+        const aim = nativeSnap ?? p; // where the click actually lands
         const a = freeAnchorRef.current;
-        const freeTol = FREE_TOL * Math.max(0.4, cfg.stabilityTolerance) * precMul;
-        // Anchor the free-space dwell to the centroid so jitter can't reset it.
-        if (!a || Math.hypot(cx - a.x, cy - a.y) > freeTol) { freeAnchorRef.current = { x: cx, y: cy }; dwellStartRef.current = now; }
-        else freeAnchorRef.current = { x: a.x + ANCHOR_EMA * (cx - a.x), y: a.y + ANCHOR_EMA * (cy - a.y) };
-        if (armedPosRef.current) { setProgress(0); progressRef.current = 0; emitRing(null); return; }
+        if (!a || Math.hypot(p.x - a.x, p.y - a.y) > FREE_TOL) { freeAnchorRef.current = { ...p }; dwellStartRef.current = now; }
+        else freeAnchorRef.current = { x: a.x + ANCHOR_EMA * (p.x - a.x), y: a.y + ANCHOR_EMA * (p.y - a.y) };
+        if (armedPosRef.current) { setProgress(0); progressRef.current = 0; return; }
         // A registered clickable (native snap) opens on the normal dwell; truly
         // empty space needs a longer, deliberate hold — cuts accidental pop-ups.
-        const dwellNeeded = (nativeSnap ? cfg.dwellMs : cfg.freeDwellMs) * precMul;
+        const dwellNeeded = nativeSnap ? DWELL_MS : FREE_DWELL_MS;
         const prog = Math.min(1, (now - dwellStartRef.current) / dwellNeeded);
         setProgress(prog); progressRef.current = prog;
-        emitRing(externalMode ? null : dwellNeeded);
-        if ((externalMode ? triggered : prog >= 1) && canClick && !menuOpenRef.current) {
-          // Empty-space commit: a drag step (down / release), a direct left-click,
-          // or open the radial action wheel for right/double/drag.
-          if (dragging) dragCommitRef.current?.(aim);
-          else if (cfg.emptyDwellAction === "click") clickRef.current?.(aim.x, aim.y);
-          else requestMenuRef.current?.(aim.x, aim.y);
+        if (prog >= 1 && canClick && !menuOpenRef.current) {
+          // Open the radial action menu at the aim point; the chosen petal
+          // dispatches the actual click type. (Direct left-click still available
+          // via the "Click" petal — kept as one glance.)
+          requestMenuRef.current?.(aim.x, aim.y);
           // Automatic drift-learning: only from a SMALL detected target, where
-          // the gaze was genuinely on it, so (center − centroid) is a clean sample.
-          const nr = nativeRef.current;
-          if (!dragging && nativeSnap && nr && nr.w < SMALL_TARGET && nr.h < SMALL_TARGET) {
-            calibrateRef.current?.({ x: cx, y: cy }, nativeSnap);
+          // the gaze was genuinely on it, so (center − gaze) is a clean sample.
+          const nr = nativeHitRef.current;
+          if (nativeSnap && nr && nr.w < SMALL_TARGET && nr.h < SMALL_TARGET) {
+            calibrateRef.current?.(p, nativeSnap);
           }
           armedPosRef.current = { ...p }; armedElRef.current = null;
-          fire(now);
+          fire(now, aim.x * window.innerWidth, aim.y * window.innerHeight);
         }
       }
     };
@@ -427,20 +380,43 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
     return () => cancelAnimationFrame(raf);
   }, [active, armed]);
 
-  // The pointer + dwell ring live in the follower cursor-ring window now (see
-  // CursorRing). This component's only remaining visual is the highlight around
-  // an in-app target being dwelled — window-local, so it's correct in both the
-  // capsule and expanded shapes. The dwell fill on the highlight border tracks
-  // `progress` subtly via opacity.
-  if (!active || !rect) return null;
-  const glow = 0.35 + 0.65 * progress;
+  if (!active || !disp) return null;
+  const px = disp.x * window.innerWidth, py = disp.y * window.innerHeight;
+  const R = 20, C = 2 * Math.PI * R;
+  const ring = !armed ? "rgba(160,170,190,0.7)" : flash ? "#34d399" : confidenceLook(confidence ?? 0).color;
+  // Confidence-aware reticle: dim + shrink slightly when tracking is uncertain,
+  // so a bright, full-size reticle signals "trust me" and a faint one says "hold
+  // still". Kept visible (not invisible) so you never lose the cursor.
+  const conf = Math.max(0, Math.min(1, confidence ?? 0));
+  const reticleOpacity = !armed ? 0.8 : 0.4 + 0.6 * conf;
+  const reticleScale = (flash ? 1.25 : 0.9 + 0.1 * conf);
+
   return (
-    <div style={{ position: "fixed", left: rect.left - 6, top: rect.top - 6,
-      width: rect.width + 12, height: rect.height + 12, borderRadius: 14,
-      border: "2px solid var(--accent)",
-      boxShadow: `0 0 16px var(--accent)`,
-      background: "var(--accent-soft)",
-      opacity: glow,
-      zIndex: 49, pointerEvents: "none", transition: "all 90ms linear" }} />
+    <>
+      {ripple && (
+        <div key={ripple.id} style={{ position: "fixed", left: ripple.x, top: ripple.y,
+          width: 60, height: 60, borderRadius: 999, border: "3px solid #34d399",
+          zIndex: 96, pointerEvents: "none", animation: "gaze-ripple 420ms ease-out forwards" }} />
+      )}
+      {rect && (
+        <div style={{ position: "fixed", left: rect.left - 6, top: rect.top - 6,
+          width: rect.width + 12, height: rect.height + 12, borderRadius: 14,
+          border: `2px solid ${flash ? "#34d399" : "var(--accent)"}`,
+          boxShadow: `0 0 16px ${flash ? "#34d399" : "var(--accent)"}66`,
+          background: `${flash ? "#34d399" : "var(--accent)"}14`,
+          zIndex: 95, pointerEvents: "none", transition: "all 90ms linear" }} />
+      )}
+      <div style={{ position: "absolute", left: px, top: py, transform: "translate(-50%,-50%)",
+        zIndex: 97, pointerEvents: "none", opacity: reticleOpacity, transition: "opacity 200ms" }}>
+        <svg width={52} height={52} viewBox="0 0 52 52" style={{ display: "block",
+          transform: `scale(${reticleScale})`, transition: "transform 120ms" }}>
+          <circle cx="26" cy="26" r={R} fill="none" stroke="rgba(255,255,255,0.22)" strokeWidth="3" />
+          <circle cx="26" cy="26" r={R} fill="none" stroke={ring} strokeWidth="3.5" strokeLinecap="round"
+            strokeDasharray={C} strokeDashoffset={C * (1 - progress)} transform="rotate(-90 26 26)"
+            style={{ transition: "stroke-dashoffset 60ms linear, stroke 200ms" }} />
+          <circle cx="26" cy="26" r="4.5" fill={ring} style={{ transition: "fill 200ms" }} />
+        </svg>
+      </div>
+    </>
   );
 }

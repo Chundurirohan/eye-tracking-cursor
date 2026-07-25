@@ -10,25 +10,19 @@ const STATUS_COLOR: Partial<Record<AppState, string>> = {
   tracking: "var(--good)", reacquiring: "var(--warn)", paused: "var(--text-3)",
 };
 
-export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrate, settingsSlot, onSettingsToggle }: {
+export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrate, settingsSlot,
+  keyboardOn = false, onToggleKeyboard }: {
   state: AppState;
   side: "left" | "right" | "center";
   armed?: boolean;
   onPauseToggle: () => void;
   onRecalibrate: () => void;
   settingsSlot: React.ReactNode;
-  /** Notifies the app when the settings popover opens/closes, so the HUD window
-   *  can grow to fit it and shrink back. */
-  onSettingsToggle?: (open: boolean) => void;
+  /** On-screen keyboard toggle (dwell-clickable). */
+  keyboardOn?: boolean;
+  onToggleKeyboard?: () => void;
 }) {
-  const [open, setOpenRaw] = useState(false);
-  const setOpen = (v: boolean | ((o: boolean) => boolean)) => {
-    setOpenRaw((prev) => {
-      const next = typeof v === "function" ? v(prev) : v;
-      if (next !== prev) onSettingsToggle?.(next);
-      return next;
-    });
-  };
+  const [open, setOpen] = useState(false);
   const paused = state === "paused";
   const pos: React.CSSProperties =
     side === "left" ? { left: "var(--s-5)" } : side === "right" ? { right: "var(--s-5)" }
@@ -54,19 +48,25 @@ export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrat
         <span style={{ width: 1, height: 18 * s, background: "var(--stroke)" }} />
         <IconBtn size={s} label={paused ? "Resume" : "Pause"} onClick={onPauseToggle}>{paused ? "▶" : "❙❙"}</IconBtn>
         <IconBtn size={s} label="Recalibrate" onClick={onRecalibrate}>⟳</IconBtn>
+        {onToggleKeyboard && (
+          <IconBtn size={s} label={keyboardOn ? "Hide keyboard" : "On-screen keyboard"}
+            active={keyboardOn} onClick={onToggleKeyboard}>⌨</IconBtn>
+        )}
         <IconBtn size={s} label="Settings" onClick={() => setOpen((o) => !o)}>⚙</IconBtn>
       </Glass>
     </div>
   );
 }
 
-function IconBtn({ children, label, onClick, size = 1 }: { children: React.ReactNode; label: string; onClick: () => void; size?: number }) {
+function IconBtn({ children, label, onClick, size = 1, active = false }: { children: React.ReactNode; label: string; onClick: () => void; size?: number; active?: boolean }) {
   return (
-    <button onClick={onClick} title={label} aria-label={label}
+    <button data-dwell onClick={onClick} title={label} aria-label={label}
       style={{ width: 30 * size, height: 30 * size, borderRadius: 999, fontSize: 13 * size, display: "grid", placeItems: "center",
-        color: "var(--text-2)", transition: "background var(--dur-fast), color var(--dur-fast), width var(--dur-med), height var(--dur-med)" }}
+        background: active ? "var(--accent-soft)" : "transparent",
+        color: active ? "var(--accent)" : "var(--text-2)",
+        transition: "background var(--dur-fast), color var(--dur-fast), width var(--dur-med), height var(--dur-med)" }}
       onMouseEnter={(e) => { e.currentTarget.style.background = "var(--accent-soft)"; e.currentTarget.style.color = "var(--text)"; }}
-      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-2)"; }}>
+      onMouseLeave={(e) => { e.currentTarget.style.background = active ? "var(--accent-soft)" : "transparent"; e.currentTarget.style.color = active ? "var(--accent)" : "var(--text-2)"; }}>
       {children}
     </button>
   );

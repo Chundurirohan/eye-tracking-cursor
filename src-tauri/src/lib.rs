@@ -7,181 +7,15 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use tauri::Manager;
 
 const SESSION_FILE: &str = "session.json";
 
-// --- Gaze space --------------------------------------------------------------
-// The screen-region (physical px + scale) that gaze coordinates are normalized
-// against. Captured ONCE when tracking starts — while the main window still
-// covers the screen — so the window can then shrink into a compact HUD capsule
-// without breaking any gaze→screen math. All cursor/click/snap commands prefer
-// this stored space over live window geometry.
-#[derive(Clone, Copy)]
-struct Space {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    scale: f64,
-}
-
-struct GazeSpace(Mutex<Option<Space>>);
-
-/// The effective gaze space: the captured one, else the window's live geometry.
-fn space_of(window: &tauri::WebviewWindow, state: &tauri::State<GazeSpace>) -> Result<Space, String> {
-    if let Some(s) = *state.0.lock().unwrap() {
-        return Ok(s);
-    }
-    let pos = window.inner_position().map_err(|e| format!("inner_position: {e}"))?;
-    let size = window.inner_size().map_err(|e| format!("inner_size: {e}"))?;
-    let scale = window.scale_factor().map_err(|e| format!("scale_factor: {e}"))?;
-    Ok(Space { x: pos.x as f64, y: pos.y as f64, w: size.width as f64, h: size.height as f64, scale })
-}
-
-/// Capture the CURRENT window geometry as the gaze space. Call at the moment
-/// tracking starts, while the window still spans the calibrated screen area.
-#[tauri::command]
-fn capture_gaze_space(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>) -> Result<(), String> {
-    let pos = window.inner_position().map_err(|e| format!("inner_position: {e}"))?;
-    let size = window.inner_size().map_err(|e| format!("inner_size: {e}"))?;
-    let scale = window.scale_factor().map_err(|e| format!("scale_factor: {e}"))?;
-    *state.0.lock().unwrap() = Some(Space {
-        x: pos.x as f64,
-        y: pos.y as f64,
-        w: size.width as f64,
-        h: size.height as f64,
-        scale,
-    });
-    Ok(())
-}
-
-// Compact HUD window bounds (physical px are derived from these logical values
-// via the gaze-space scale). Bottom-center of the gaze space. The camera feed +
-// control bar live here; it never resizes during tracking.
-const HUD_W: f64 = 460.0;
-const HUD_H: f64 = 236.0;
-
-/// Set the main window to one of its two OPAQUE shapes, using explicit frame
-/// geometry — NEVER macOS `zoom`/maximize, which animates the frame and made the
-/// whole app "slide to a corner" on interaction. Gaze-anchored surfaces live in
-/// their own separate windows (wheel/keyboard/ring), so the main window only
-/// changes shape on deliberate transitions, and does so instantly.
-///  - "full": cover the current display (onboarding / calibration / panels)
-///  - "hud":  compact HUD, bottom-center of the gaze space (active tracking)
-#[tauri::command]
-fn set_window_mode(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, mode: String) -> Result<(), String> {
-    let ring = window.app_handle().get_webview_window("ring");
-    match mode.as_str() {
-        "full" => {
-            if let Some(r) = &ring {
-                let _ = r.hide();
-            }
-            let _ = window.show();
-            // Cover the display that currently hosts the window (physical px, no
-            // zoom animation).
-            if let Ok(Some(mon)) = window.current_monitor() {
-                let p = mon.position();
-                let s = mon.size();
-                window.set_position(tauri::PhysicalPosition::new(p.x, p.y)).map_err(|e| format!("set_position: {e}"))?;
-                window.set_size(tauri::PhysicalSize::new(s.width, s.height)).map_err(|e| format!("set_size: {e}"))?;
-            }
-            // Keep the (accessory-policy) app ACTIVE during calibration: WKWebView
-            // throttles rAF in inactive apps, which visibly stutters the dot.
-            let _ = window.set_focus();
-            Ok(())
-        }
-        "hud" => {
-            if let Some(r) = &ring {
-                let _ = r.show();
-            }
-            let s = space_of(&window, &state)?;
-            // Physical bounds: bottom-center of the gaze space.
-            let w = HUD_W * s.scale;
-            let h = HUD_H * s.scale;
-            let x = s.x + (s.w - w) / 2.0;
-            let y = s.y + s.h - h - 16.0 * s.scale; // small gap from the bottom edge
-            window.set_size(tauri::PhysicalSize::new(w as u32, h as u32)).map_err(|e| format!("set_size: {e}"))?;
-            window.set_position(tauri::PhysicalPosition::new(x as i32, y as i32)).map_err(|e| format!("set_position: {e}"))?;
-            Ok(())
-        }
-        other => Err(format!("unknown window mode: {other}")),
-    }
-}
-
-/// Show an overlay window (wheel/keyboard) centered on a gaze point (normalized
-/// to the gaze space), clamped on-screen. Positioned + shown — never resized.
-#[tauri::command]
-fn show_overlay_at(app: tauri::AppHandle, window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, label: String, nx: f64, ny: f64) -> Result<(), String> {
-    let s = space_of(&window, &state)?;
-    if let Some(w) = app.get_webview_window(&label) {
-        let size = w.outer_size().map_err(|e| format!("outer_size: {e}"))?;
-        let (ww, wh) = (size.width as f64, size.height as f64);
-        // Center on the gaze point (physical), clamp fully inside the gaze space.
-        let gx = s.x + nx * s.w;
-        let gy = s.y + ny * s.h;
-        let px = (gx - ww / 2.0).clamp(s.x, s.x + s.w - ww);
-        let py = (gy - wh / 2.0).clamp(s.y, s.y + s.h - wh);
-        w.set_position(tauri::PhysicalPosition::new(px as i32, py as i32)).map_err(|e| format!("set_position: {e}"))?;
-        w.show().map_err(|e| format!("show: {e}"))?;
-    }
-    Ok(())
-}
-
-/// Show an overlay window docked to the bottom-center of the gaze space (keyboard).
-#[tauri::command]
-fn show_overlay_bottom(app: tauri::AppHandle, window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, label: String) -> Result<(), String> {
-    let s = space_of(&window, &state)?;
-    if let Some(w) = app.get_webview_window(&label) {
-        let size = w.outer_size().map_err(|e| format!("outer_size: {e}"))?;
-        let (ww, wh) = (size.width as f64, size.height as f64);
-        let px = s.x + (s.w - ww) / 2.0;
-        let py = s.y + s.h - wh - 12.0 * s.scale;
-        w.set_position(tauri::PhysicalPosition::new(px as i32, py as i32)).map_err(|e| format!("set_position: {e}"))?;
-        w.show().map_err(|e| format!("show: {e}"))?;
-    }
-    Ok(())
-}
-
-/// Hide an overlay window.
-#[tauri::command]
-fn hide_overlay(app: tauri::AppHandle, label: String) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window(&label) {
-        w.hide().map_err(|e| format!("hide: {e}"))?;
-    }
-    Ok(())
-}
-
-#[derive(serde::Serialize)]
-struct GazeMapping {
-    gsx: f64,
-    gsy: f64,
-    gsw: f64,
-    gsh: f64,
-    wx: f64,
-    wy: f64,
-    scale: f64,
-}
-
-/// The gaze space plus the calling window's current position — everything the
-/// frontend needs to convert gaze-normalized points to window-local CSS pixels
-/// (and back) after the window has morphed into the HUD capsule.
-#[tauri::command]
-fn gaze_mapping(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>) -> Result<GazeMapping, String> {
-    let s = space_of(&window, &state)?;
-    let pos = window.inner_position().map_err(|e| format!("inner_position: {e}"))?;
-    let scale = window.scale_factor().map_err(|e| format!("scale_factor: {e}"))?;
-    Ok(GazeMapping {
-        gsx: s.x,
-        gsy: s.y,
-        gsw: s.w,
-        gsh: s.h,
-        wx: pos.x as f64,
-        wy: pos.y as f64,
-        scale,
-    })
-}
+/// Shared cache of nearby clickable targets (global logical points), kept fresh
+/// by a background scanner thread so the frontend can hit-test locally every
+/// frame — instant system-wide magnetism instead of throttled async queries.
+#[derive(Default)]
+struct TargetCache(std::sync::Arc<std::sync::Mutex<Vec<(f64, f64, f64, f64)>>>);
 
 /// Resolve `<app_data_dir>/session.json`, creating the directory if needed.
 fn session_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -316,30 +150,6 @@ mod mac_input {
         Ok(())
     }
 
-    /// Begin a drag: warp to (x,y), then press & hold the left button.
-    pub fn drag_start(x: f64, y: f64) -> Result<(), String> {
-        unsafe { CGWarpMouseCursorPosition(CGPoint::new(x, y)); }
-        event(CGEventType::MouseMoved, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
-        event(CGEventType::LeftMouseDown, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
-        Ok(())
-    }
-
-    /// Continue a drag: post a left-button DRAG event to (x,y). Apps need dragged
-    /// events (not plain moves) to update a selection/window during the drag.
-    pub fn drag_to(x: f64, y: f64) -> Result<(), String> {
-        unsafe { CGWarpMouseCursorPosition(CGPoint::new(x, y)); }
-        event(CGEventType::LeftMouseDragged, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
-        Ok(())
-    }
-
-    /// Finish a drag: final drag event then release the left button at (x,y).
-    pub fn drag_end(x: f64, y: f64) -> Result<(), String> {
-        unsafe { CGWarpMouseCursorPosition(CGPoint::new(x, y)); }
-        event(CGEventType::LeftMouseDragged, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
-        event(CGEventType::LeftMouseUp, CGMouseButton::Left, x, y)?.post(CGEventTapLocation::HID);
-        Ok(())
-    }
-
     /// Type a Unicode string into the focused app (on-screen keyboard). Posts a
     /// keyboard event carrying the string, so it lands wherever the caret is.
     pub fn type_text(text: &str) -> Result<(), String> {
@@ -354,14 +164,6 @@ mod mac_input {
         Ok(())
     }
 
-    /// Current global cursor position in logical points (top-left origin).
-    pub fn cursor_location() -> Option<(f64, f64)> {
-        let src = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
-        let e = CGEvent::new(src).ok()?;
-        let p = e.location();
-        Some((p.x, p.y))
-    }
-
     /// Tap a virtual key by macOS keycode (e.g. 51 delete, 36 return, 49 space).
     pub fn key_tap(code: u16) -> Result<(), String> {
         let d = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| "event source".to_string())?;
@@ -369,6 +171,16 @@ mod mac_input {
         let u = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| "event source".to_string())?;
         CGEvent::new_keyboard_event(u, code as CGKeyCode, false).map_err(|_| "key event".to_string())?.post(CGEventTapLocation::HID);
         Ok(())
+    }
+
+    /// Current global cursor position in logical points (top-left origin). The
+    /// background target scanner scans around this (the cursor tracks the gaze
+    /// while armed), so magnetism never waits on a synchronous per-frame query.
+    pub fn cursor_location() -> Option<(f64, f64)> {
+        let src = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
+        let e = CGEvent::new(src).ok()?;
+        let p = e.location();
+        Some((p.x, p.y))
     }
 }
 
@@ -432,14 +244,12 @@ mod mac_ax {
         matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox" | "AXSearchField")
     }
 
-    /// Whether the system-wide focused UI element is an editable text field —
-    /// the trigger for auto-showing the on-screen keyboard. Cheap enough to poll
-    /// a few times a second. Requires Accessibility (returns false without it).
+    /// Whether the system-wide focused UI element is an editable text field — the
+    /// trigger for auto-showing the on-screen keyboard. Cheap enough to poll a few
+    /// times a second. Requires Accessibility (returns false without it).
     pub unsafe fn focused_is_text() -> bool {
         let sys = AXUIElementCreateSystemWide();
-        if sys.is_null() {
-            return false;
-        }
+        if sys.is_null() { return false; }
         // Try the system-wide focused element directly; fall back through the
         // focused application (some apps only expose it there).
         let focused = copy_attr(sys, "AXFocusedUIElement").or_else(|| {
@@ -449,10 +259,7 @@ mod mac_ax {
             f
         });
         CFRelease(sys as CFTypeRef);
-        let el = match focused {
-            Some(e) => e as AXUIElementRef,
-            None => return false,
-        };
+        let el = match focused { Some(e) => e as AXUIElementRef, None => return false };
         let is_text = ax_role(el).map(|r| is_text_role(&r)).unwrap_or(false);
         CFRelease(el as CFTypeRef);
         is_text
@@ -549,166 +356,191 @@ mod mac_ax {
         CFRelease(app as CFTypeRef);
         best.map(|(_, cx, cy, w, h)| (cx, cy, w, h))
     }
+
+    /// ALL clickable targets (from the focused app) within `radius` logical points
+    /// of (gx,gy) — a dense grid hit-test, deduped by center. This is what the
+    /// background scanner caches so the frontend can hit-test locally every frame
+    /// (instant magnetism + boxes) instead of waiting on throttled async queries.
+    /// Returns each as (center_x, center_y, w, h) in global logical points.
+    pub unsafe fn all_targets(gx: f64, gy: f64, radius: f64, my_pid: i32) -> Vec<(f64, f64, f64, f64)> {
+        let mut out: Vec<(f64, f64, f64, f64)> = Vec::new();
+        let sys = AXUIElementCreateSystemWide();
+        if sys.is_null() { return out; }
+        let app = copy_attr(sys, "AXFocusedApplication");
+        CFRelease(sys as CFTypeRef);
+        let app = match app { Some(a) => a as AXUIElementRef, None => return out };
+        if same_pid(app, my_pid) { CFRelease(app as CFTypeRef); return out; }
+
+        // Dense grid: step ~36pt catches small toolbar buttons without exploding
+        // the probe count. Bounded so a huge radius can't stall the scan thread.
+        let step = 36.0_f64;
+        let n = ((radius / step) as i32).clamp(1, 6);
+        for iy in -n..=n {
+            for ix in -n..=n {
+                let px = gx + ix as f64 * step;
+                let py = gy + iy as f64 * step;
+                let mut el: AXUIElementRef = std::ptr::null();
+                let err = AXUIElementCopyElementAtPosition(app, px as f32, py as f32, &mut el);
+                if err != 0 || el.is_null() { continue; }
+                if let Some((cx, cy, w, h)) = actionable_rect(el) {
+                    // Dedup by center proximity (the grid hits the same button many
+                    // times) and drop absurdly large hits (containers, not buttons).
+                    if w < 600.0 && h < 600.0
+                        && !out.iter().any(|&(ex, ey, _, _)| (ex - cx).abs() < 6.0 && (ey - cy).abs() < 6.0)
+                    {
+                        out.push((cx, cy, w, h));
+                    }
+                }
+                CFRelease(el as CFTypeRef);
+                if out.len() >= 48 { CFRelease(app as CFTypeRef); return out; }
+            }
+        }
+        CFRelease(app as CFTypeRef);
+        out
+    }
 }
 
 /// Snap to the nearest system-wide clickable near a gaze point (normalized to
-/// the gaze space). Returns (nx, ny, w_norm, h_norm) of the target center, or
+/// window content). Returns (nx, ny, w_norm, h_norm) of the target center, or
 /// None. All AX complexity is isolated here; the frontend just gets a point.
 #[tauri::command]
-fn snap_target(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, nx: f64, ny: f64, radius: f64) -> Result<Option<(f64, f64, f64, f64)>, String> {
+fn snap_target(window: tauri::WebviewWindow, nx: f64, ny: f64, radius: f64) -> Result<Option<(f64, f64, f64, f64)>, String> {
     #[cfg(target_os = "macos")]
     {
-        let s = space_of(&window, &state)?;
-        let gx = (s.x + nx * s.w) / s.scale;
-        let gy = (s.y + ny * s.h) / s.scale;
-        let radius_px = radius * s.w / s.scale;
+        let pos = window.inner_position().map_err(|e| format!("inner_position: {e}"))?;
+        let size = window.inner_size().map_err(|e| format!("inner_size: {e}"))?;
+        let scale = window.scale_factor().map_err(|e| format!("scale_factor: {e}"))?;
+        let (w, h) = (size.width as f64, size.height as f64);
+        let gx = (pos.x as f64 + nx * w) / scale;
+        let gy = (pos.y as f64 + ny * h) / scale;
+        let radius_px = radius * w / scale;
         let my_pid = std::process::id() as i32;
         let res = unsafe { mac_ax::nearest_target(gx, gy, radius_px, my_pid) };
         Ok(res.map(|(cx, cy, tw, th)| {
-            let bnx = (cx * s.scale - s.x) / s.w;
-            let bny = (cy * s.scale - s.y) / s.h;
-            (bnx, bny, tw * s.scale / s.w, th * s.scale / s.h)
+            let bnx = (cx * scale - pos.x as f64) / w;
+            let bny = (cy * scale - pos.y as f64) / h;
+            (bnx, bny, tw * scale / w, th * scale / h)
         }))
     }
     #[cfg(not(target_os = "macos"))]
-    { let _ = (window, state, nx, ny, radius); Ok(None) }
+    { let _ = (window, nx, ny, radius); Ok(None) }
 }
 
-/// Map a gaze point (normalized to the gaze space) to a global screen point in
-/// logical points (top-left origin) — the space CoreGraphics uses. Uses the
-/// captured gaze space when present, so the mapping stays correct after the
-/// main window shrinks into the HUD capsule.
-#[cfg(target_os = "macos")]
-fn to_global(window: &tauri::WebviewWindow, state: &tauri::State<GazeSpace>, nx: f64, ny: f64) -> Result<(f64, f64), String> {
-    let s = space_of(window, state)?;
-    Ok(((s.x + nx * s.w) / s.scale, (s.y + ny * s.h) / s.scale))
-}
-
-/// Assert click-through ONLY when this window substantially covers the gaze
-/// space (i.e. it's the full-screen overlay that could shield the click). The
-/// compact HUD capsule must keep receiving real mouse clicks, so it is never
-/// forced click-through by a synthetic click elsewhere on screen.
-#[cfg(target_os = "macos")]
-fn shield_guard(window: &tauri::WebviewWindow, state: &tauri::State<GazeSpace>) {
-    let covering = (|| -> Result<bool, String> {
-        let s = space_of(window, state)?;
-        let size = window.inner_size().map_err(|e| format!("inner_size: {e}"))?;
-        Ok(size.width as f64 >= 0.9 * s.w && size.height as f64 >= 0.9 * s.h)
-    })()
-    .unwrap_or(true);
-    if covering {
-        let _ = window.set_ignore_cursor_events(true);
-    }
-}
-
-const RING_HALF: f64 = 32.0; // ring window is 64×64 logical
-
-/// Follow the REAL OS cursor with the ring window from a dedicated thread —
-/// decoupled from the warp path so cursor warps stay dirt-cheap. Polls at
-/// ~30Hz and only issues a window move when the cursor actually moved, so a
-/// parked (fixation-locked) cursor costs zero window-server traffic.
-#[cfg(target_os = "macos")]
-fn spawn_ring_follower(app: tauri::AppHandle) {
-    std::thread::spawn(move || {
-        let mut last = (f64::NAN, f64::NAN);
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(33));
-            let Some((x, y)) = mac_input::cursor_location() else { continue };
-            if (x - last.0).abs() < 1.5 && (y - last.1).abs() < 1.5 {
-                continue;
-            }
-            last = (x, y);
-            if let Some(ring) = app.get_webview_window("ring") {
-                let _ = ring.set_position(tauri::LogicalPosition::new(x - RING_HALF, y - RING_HALF));
-            }
-        }
-    });
-}
-
-/// Watch the system-wide focused element from a dedicated thread and emit
-/// `gaze:text-focus` (bool) whenever it changes between an editable text field
-/// and not — the signal the frontend uses to auto-show/hide the keyboard.
-#[cfg(target_os = "macos")]
-fn spawn_text_focus_watcher(app: tauri::AppHandle) {
-    use tauri::Emitter;
-    std::thread::spawn(move || {
-        let mut last = false;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let now = unsafe { mac_ax::focused_is_text() };
-            if now != last {
-                last = now;
-                let _ = app.emit("gaze:text-focus", now);
-            }
-        }
-    });
-}
-
-/// Move the OS cursor to a gaze point (normalized to the gaze space).
+/// All nearby clickable targets, from the background scanner's cache, converted
+/// to this window's normalized content coords (nx, ny, w_norm, h_norm). The
+/// frontend refreshes this a few times a second and hit-tests it locally every
+/// frame, so system-wide magnetism (and its highlight box) is instant.
 #[tauri::command]
-fn warp_cursor(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, nx: f64, ny: f64) -> Result<(), String> {
+fn nearby_targets(window: tauri::WebviewWindow, state: tauri::State<TargetCache>) -> Result<Vec<(f64, f64, f64, f64)>, String> {
     #[cfg(target_os = "macos")]
     {
-        let (x, y) = to_global(&window, &state, nx, ny)?;
-        mac_input::warp(x, y)
+        let pos = window.inner_position().map_err(|e| format!("inner_position: {e}"))?;
+        let size = window.inner_size().map_err(|e| format!("inner_size: {e}"))?;
+        let scale = window.scale_factor().map_err(|e| format!("scale_factor: {e}"))?;
+        let (w, h) = (size.width as f64, size.height as f64);
+        let list = state.0.lock().map_err(|_| "target cache poisoned".to_string())?.clone();
+        Ok(list.into_iter().map(|(cx, cy, tw, th)| {
+            let bnx = (cx * scale - pos.x as f64) / w;
+            let bny = (cy * scale - pos.y as f64) / h;
+            (bnx, bny, tw * scale / w, th * scale / h)
+        }).collect())
     }
     #[cfg(not(target_os = "macos"))]
-    { let _ = (window, state, nx, ny); Err("native cursor control is macOS-only".into()) }
+    { let _ = (window, state); Ok(vec![]) }
 }
 
-/// Left-click at a gaze point (normalized to the gaze space).
+/// Continuously scan around the cursor (which tracks the gaze while armed) for
+/// nearby clickables and keep the shared cache fresh, off the render thread.
+#[cfg(target_os = "macos")]
+fn spawn_target_scanner(cache: std::sync::Arc<std::sync::Mutex<Vec<(f64, f64, f64, f64)>>>) {
+    let my_pid = std::process::id() as i32;
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        if let Some((gx, gy)) = mac_input::cursor_location() {
+            let targets = unsafe { mac_ax::all_targets(gx, gy, 200.0, my_pid) };
+            if let Ok(mut c) = cache.lock() { *c = targets; }
+        }
+    });
+}
+
+/// Map a gaze point normalized to the window's content (0–1) to a global screen
+/// point in logical points (top-left origin) — the space CoreGraphics uses.
+/// Computed from the real window geometry so the OS cursor lands exactly under
+/// the in-app indicator (JS `window.screenX/innerWidth` was unreliable in the
+/// WKWebView and left the cursor offset).
+#[cfg(target_os = "macos")]
+fn to_global(window: &tauri::WebviewWindow, nx: f64, ny: f64) -> Result<(f64, f64), String> {
+    let pos = window.inner_position().map_err(|e| format!("inner_position: {e}"))?;
+    let size = window.inner_size().map_err(|e| format!("inner_size: {e}"))?;
+    let scale = window.scale_factor().map_err(|e| format!("scale_factor: {e}"))?;
+    let gx = (pos.x as f64 + nx * size.width as f64) / scale;
+    let gy = (pos.y as f64 + ny * size.height as f64) / scale;
+    Ok((gx, gy))
+}
+
+/// Move the OS cursor to a gaze point (normalized to the window content).
 #[tauri::command]
-fn mouse_click(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, nx: f64, ny: f64) -> Result<(), String> {
+fn warp_cursor(window: tauri::WebviewWindow, nx: f64, ny: f64) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    { let (x, y) = to_global(&window, nx, ny)?; mac_input::warp(x, y) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (window, nx, ny); Err("native cursor control is macOS-only".into()) }
+}
+
+/// Left-click at a gaze point (normalized to the window content).
+#[tauri::command]
+fn mouse_click(window: tauri::WebviewWindow, nx: f64, ny: f64) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let (x, y) = to_global(&window, &state, nx, ny)?;
-        // If this window is the full-screen overlay, guarantee it's click-through
-        // at the instant of the click so the synthetic event passes to the app
-        // beneath instead of being caught by our own always-on-top window.
-        shield_guard(&window, &state);
+        let (x, y) = to_global(&window, nx, ny)?;
+        // Guarantee the overlay is click-through at the instant of the click so
+        // the synthetic event passes to the app beneath instead of being caught
+        // by our own always-on-top window (the "shield"). Don't rely on the
+        // frontend having already asserted it.
+        let _ = window.set_ignore_cursor_events(true);
         mac_input::click(x, y)
     }
     #[cfg(not(target_os = "macos"))]
-    { let _ = (window, state, nx, ny); Err("native clicking is macOS-only".into()) }
+    { let _ = (window, nx, ny); Err("native clicking is macOS-only".into()) }
 }
 
-/// Right-click at a gaze point (normalized to gaze space) — context menus.
+/// Right-click at a gaze point (normalized to window content) — context menus.
 #[tauri::command]
-fn mouse_right_click(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, nx: f64, ny: f64) -> Result<(), String> {
+fn mouse_right_click(window: tauri::WebviewWindow, nx: f64, ny: f64) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let (x, y) = to_global(&window, &state, nx, ny)?;
-        shield_guard(&window, &state);
+        let (x, y) = to_global(&window, nx, ny)?;
+        let _ = window.set_ignore_cursor_events(true);
         mac_input::right_click(x, y)
     }
     #[cfg(not(target_os = "macos"))]
-    { let _ = (window, state, nx, ny); Err("native clicking is macOS-only".into()) }
+    { let _ = (window, nx, ny); Err("native clicking is macOS-only".into()) }
 }
 
-/// Double-click at a gaze point (normalized to gaze space).
+/// Double-click at a gaze point (normalized to window content).
 #[tauri::command]
-fn mouse_double_click(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, nx: f64, ny: f64) -> Result<(), String> {
+fn mouse_double_click(window: tauri::WebviewWindow, nx: f64, ny: f64) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let (x, y) = to_global(&window, &state, nx, ny)?;
-        shield_guard(&window, &state);
+        let (x, y) = to_global(&window, nx, ny)?;
+        let _ = window.set_ignore_cursor_events(true);
         mac_input::double_click(x, y)
     }
     #[cfg(not(target_os = "macos"))]
-    { let _ = (window, state, nx, ny); Err("native clicking is macOS-only".into()) }
+    { let _ = (window, nx, ny); Err("native clicking is macOS-only".into()) }
 }
 
 /// Scroll the app under the cursor vertically by `dy` pixels. Powers edge-gaze
 /// scrolling / hands-free reading.
 #[tauri::command]
-fn mouse_scroll(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, dy: i32) -> Result<(), String> {
+fn mouse_scroll(window: tauri::WebviewWindow, dy: i32) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        shield_guard(&window, &state);
+        let _ = window.set_ignore_cursor_events(true);
         mac_input::scroll(dy)
     }
     #[cfg(not(target_os = "macos"))]
-    { let _ = (window, state, dy); Err("native scrolling is macOS-only".into()) }
+    { let _ = (window, dy); Err("native scrolling is macOS-only".into()) }
 }
 
 /// Make the overlay window transparent to mouse events (click-through) or not.
@@ -767,36 +599,6 @@ fn request_accessibility() -> bool {
     { true }
 }
 
-/// Begin a gaze-driven drag at a normalized point (press & hold left button).
-#[tauri::command]
-fn mouse_drag_start(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, nx: f64, ny: f64) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    { let (x, y) = to_global(&window, &state, nx, ny)?; shield_guard(&window, &state); mac_input::drag_start(x, y) }
-    #[cfg(not(target_os = "macos"))]
-    { let _ = (window, state, nx, ny); Err("native dragging is macOS-only".into()) }
-}
-
-/// Continue a gaze-driven drag to a normalized point.
-#[tauri::command]
-fn mouse_drag_to(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, nx: f64, ny: f64) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let (x, y) = to_global(&window, &state, nx, ny)?;
-        mac_input::drag_to(x, y)
-    }
-    #[cfg(not(target_os = "macos"))]
-    { let _ = (window, state, nx, ny); Err("native dragging is macOS-only".into()) }
-}
-
-/// Finish a gaze-driven drag at a normalized point (release left button).
-#[tauri::command]
-fn mouse_drag_end(window: tauri::WebviewWindow, state: tauri::State<GazeSpace>, nx: f64, ny: f64) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    { let (x, y) = to_global(&window, &state, nx, ny)?; shield_guard(&window, &state); mac_input::drag_end(x, y) }
-    #[cfg(not(target_os = "macos"))]
-    { let _ = (window, state, nx, ny); Err("native dragging is macOS-only".into()) }
-}
-
 /// Type a Unicode string into the focused app (on-screen keyboard).
 #[tauri::command]
 fn type_text(text: String) -> Result<(), String> {
@@ -815,59 +617,23 @@ fn key_tap(code: u16) -> Result<(), String> {
     { let _ = code; Err("native typing is macOS-only".into()) }
 }
 
-/// List connected displays by name (for the multi-monitor picker).
-#[tauri::command]
-fn list_monitors(window: tauri::WebviewWindow) -> Result<Vec<String>, String> {
-    let mons = window.available_monitors().map_err(|e| format!("monitors: {e}"))?;
-    Ok(mons.iter().enumerate()
-        .map(|(i, m)| m.name().cloned().unwrap_or_else(|| format!("Display {}", i + 1)))
-        .collect())
-}
-
-/// Move + size the overlay to cover a chosen display. Because calibration is
-/// screen-relative, the frontend should recalibrate after switching displays.
-#[tauri::command]
-fn move_to_monitor(window: tauri::WebviewWindow, index: usize) -> Result<(), String> {
-    let mons = window.available_monitors().map_err(|e| format!("monitors: {e}"))?;
-    let m = mons.get(index).ok_or_else(|| "monitor index out of range".to_string())?;
-    let pos = m.position();
-    let size = m.size();
-    window.set_position(tauri::PhysicalPosition::new(pos.x, pos.y)).map_err(|e| format!("set_position: {e}"))?;
-    window.set_size(tauri::PhysicalSize::new(size.width, size.height)).map_err(|e| format!("set_size: {e}"))?;
-    Ok(())
-}
-
-/// Temporary diagnostics tap: prints frontend perf telemetry to the terminal so
-/// lag reports come with numbers (webview console isn't visible in `tauri dev`).
-#[tauri::command]
-fn log_perf(msg: String) {
-    println!("[gaze-perf] {msg}");
-}
-
-/// Set the menu-bar status text next to the tray icon (empty = icon only).
-#[tauri::command]
-fn set_tray_status(app: tauri::AppHandle, text: String) -> Result<(), String> {
-    if let Some(tray) = app.tray_by_id("gaze-tray") {
-        let t = if text.is_empty() { None } else { Some(text) };
-        tray.set_title(t).map_err(|e| format!("set_title: {e}"))?;
-    }
-    Ok(())
-}
-
-/// Open the macOS Accessibility settings pane directly, so the user can grant
-/// (or re-grant, after a rebuild invalidated it) permission in one tap.
-#[tauri::command]
-fn open_accessibility_settings() -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("open settings: {e}"))
-    }
-    #[cfg(not(target_os = "macos"))]
-    { Ok(()) }
+/// Watch the system-wide focused element from a dedicated thread and emit
+/// `gaze:text-focus` (bool) whenever it changes between an editable text field
+/// and not — the signal the frontend uses to auto-show/hide the keyboard.
+#[cfg(target_os = "macos")]
+fn spawn_text_focus_watcher(app: tauri::AppHandle) {
+    use tauri::Emitter;
+    std::thread::spawn(move || {
+        let mut last = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let now = unsafe { mac_ax::focused_is_text() };
+            if now != last {
+                last = now;
+                let _ = app.emit("gaze:text-focus", now);
+            }
+        }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -882,16 +648,12 @@ pub fn run() {
     let arm_toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
     let pause_toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
     let reanchor = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyR);
-    // ⌃⌥Return = "switch" click (fires a click at the gaze in switch activation mode).
-    let switch_click = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Enter);
-    // ⌃⌥K toggles the hands-free on-screen keyboard.
-    let keyboard = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyK);
-    // ⌃⌥T runs the accuracy test; ⌃⌥Z toggles precision (fine-targeting) mode.
-    let accuracy_test = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyT);
-    let precision = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyZ);
+
+    // Shared nearby-target cache, kept fresh by the background scanner thread.
+    let target_cache = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
     tauri::Builder::default()
-        .manage(GazeSpace(Mutex::new(None)))
+        .manage(TargetCache(target_cache.clone()))
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -903,105 +665,24 @@ pub fn run() {
                         let _ = app.emit("gaze:toggle-pause", ());
                     } else if shortcut == &reanchor {
                         let _ = app.emit("gaze:reanchor", ());
-                    } else if shortcut == &switch_click {
-                        let _ = app.emit("gaze:switch-click", ());
-                    } else if shortcut == &keyboard {
-                        let _ = app.emit("gaze:toggle-keyboard", ());
-                    } else if shortcut == &accuracy_test {
-                        let _ = app.emit("gaze:accuracy-test", ());
-                    } else if shortcut == &precision {
-                        let _ = app.emit("gaze:toggle-precision", ());
                     }
                 })
                 .build(),
         )
-        // Utility behavior: closing the main window HIDES it (tracking state is
-        // paused via an event so gaze control never silently stops while the
-        // webview is throttled). Quit only via the menu-bar item.
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.app_handle().emit("gaze:force-pause", ());
-                let _ = window.hide();
-            }
-        })
         .setup(move |app| {
             app.global_shortcut().register(arm_toggle)?;
             app.global_shortcut().register(pause_toggle)?;
             app.global_shortcut().register(reanchor)?;
-            app.global_shortcut().register(switch_click)?;
-            app.global_shortcut().register(keyboard)?;
-            app.global_shortcut().register(accuracy_test)?;
-            app.global_shortcut().register(precision)?;
             // Surface the real Accessibility prompt on launch if we're not yet
             // trusted, so the app gets registered/granted properly.
             #[cfg(target_os = "macos")]
             { let _ = prompt_accessibility(); }
-
-            // Background-utility presence: no Dock icon / app-switcher entry —
-            // Gaze lives in the menu bar like a real macOS utility.
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-
-            // Menu-bar (tray) item: the app's persistent, quiet home. Open
-            // restores the main window; Pause/Resume and Recalibrate reuse the
-            // existing event wiring; Quit is the only way to exit.
-            {
-                use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-                use tauri::tray::TrayIconBuilder;
-                let open = MenuItem::with_id(app, "open", "Open Gaze", true, None::<&str>)?;
-                let pause = MenuItem::with_id(app, "pause", "Pause / Resume\t⌃⌥P", true, None::<&str>)?;
-                let recal = MenuItem::with_id(app, "recalibrate", "Recalibrate…", true, None::<&str>)?;
-                let sep = PredefinedMenuItem::separator(app)?;
-                let quit = MenuItem::with_id(app, "quit", "Quit Gaze", true, None::<&str>)?;
-                let menu = Menu::with_items(app, &[&open, &pause, &recal, &sep, &quit])?;
-                let mut tray = TrayIconBuilder::with_id("gaze-tray")
-                    .menu(&menu)
-                    .show_menu_on_left_click(true)
-                    .tooltip("Gaze — eye tracking");
-                if let Some(icon) = app.default_window_icon().cloned() {
-                    tray = tray.icon(icon);
-                }
-                tray.on_menu_event(|app, event| {
-                    match event.id.as_ref() {
-                        "open" => {
-                            if let Some(w) = app.get_webview_window("main") {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
-                        }
-                        "pause" => { let _ = app.emit("gaze:toggle-pause", ()); }
-                        "recalibrate" => {
-                            if let Some(w) = app.get_webview_window("main") {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
-                            let _ = app.emit("gaze:recalibrate", ());
-                        }
-                        "quit" => app.exit(0),
-                        _ => {}
-                    }
-                })
-                .build(app)?;
-            }
-
-            // First launch: make sure the (accessory-policy) window is in front.
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
-
-            // Ring follows the real cursor from its own thread — never from the
-            // hot warp path. Hidden until tracking starts (set_window_mode shows
-            // it for capsule/expanded and hides it for full).
-            if let Some(r) = app.get_webview_window("ring") {
-                let _ = r.hide();
-            }
-            #[cfg(target_os = "macos")]
-            spawn_ring_follower(app.handle().clone());
-            // Watch for focused text fields to auto-raise the on-screen keyboard.
+            // Auto-show the on-screen keyboard when a text field takes focus.
             #[cfg(target_os = "macos")]
             spawn_text_focus_watcher(app.handle().clone());
+            // Keep the nearby-clickable cache warm for instant magnetism.
+            #[cfg(target_os = "macos")]
+            spawn_target_scanner(target_cache.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1015,24 +696,11 @@ pub fn run() {
             mouse_scroll,
             set_click_through,
             snap_target,
-            is_trusted,
-            request_accessibility,
-            open_accessibility_settings,
-            mouse_drag_start,
-            mouse_drag_to,
-            mouse_drag_end,
+            nearby_targets,
             type_text,
             key_tap,
-            list_monitors,
-            move_to_monitor,
-            capture_gaze_space,
-            gaze_mapping,
-            set_window_mode,
-            show_overlay_at,
-            show_overlay_bottom,
-            hide_overlay,
-            log_perf,
-            set_tray_status
+            is_trusted,
+            request_accessibility
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

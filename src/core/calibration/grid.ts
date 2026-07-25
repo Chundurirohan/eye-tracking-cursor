@@ -49,11 +49,8 @@ export function pointResidual(m: CalibrationModel, p: CalibrationPoint): number 
   return e / p.samples.length;
 }
 
-/** The calibration point grid. "full" is a 5×5 (25-point) grid; "quick" is a
- * 3×3 (9-point) grid for a faster top-up calibration. */
-export function buildGrid(mode: "full" | "quick" = "full"): CalibrationPoint[] {
-  const n = mode === "quick" ? 3 : 5;
-  const rows = n, cols = n;
+export function buildGrid(): CalibrationPoint[] {
+  const rows = 5, cols = 5;
   const variations: HeadDirection[] = ["center", "left", "right", "up", "down"];
   const pts: CalibrationPoint[] = [];
   let id = 0;

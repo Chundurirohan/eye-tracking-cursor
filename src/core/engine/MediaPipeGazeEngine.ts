@@ -17,14 +17,6 @@ const R_EYE_LID = [386, 374];
 
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 
-// Bundled (offline-capable) MediaPipe assets, served from the app root in both
-// dev and the packaged build. CDN URLs are the fallback only.
-const LOCAL_WASM = "/mediapipe/wasm";
-const LOCAL_MODEL = "/mediapipe/face_landmarker.task";
-const CDN_WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
-const CDN_MODEL =
-  "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
-
 export class MediaPipeGazeEngine implements IGazeEngine {
   readonly capabilities: EngineCapabilities = {
     name: "MediaPipe FaceLandmarker",
@@ -45,28 +37,22 @@ export class MediaPipeGazeEngine implements IGazeEngine {
   // even when the user is doing everything right.
   setCollecting(active: boolean): void { this.collecting = active; }
 
-  private async build(wasmBase: string, modelPath: string): Promise<FaceLandmarker> {
-    const fileset = await FilesetResolver.forVisionTasks(wasmBase);
-    return FaceLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: modelPath, delegate: "GPU" },
+  async init(): Promise<void> {
+    if (this.landmarker) return;
+    const fileset = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    this.landmarker = await FaceLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate: "GPU",
+      },
       runningMode: "VIDEO",
       numFaces: 1,
       outputFaceBlendshapes: false,
       outputFacialTransformationMatrixes: true,
     });
-  }
-
-  async init(): Promise<void> {
-    if (this.landmarker) return;
-    // Prefer the bundled assets (offline-capable); fall back to the CDN if
-    // they're missing. Runtime inference speed is unaffected by the source (the
-    // GPU delegate does the heavy lifting), so this can't hurt smoothness.
-    try {
-      this.landmarker = await this.build(LOCAL_WASM, LOCAL_MODEL);
-    } catch (err) {
-      console.warn("[gaze] bundled MediaPipe assets unavailable — falling back to CDN", err);
-      this.landmarker = await this.build(CDN_WASM, CDN_MODEL);
-    }
   }
 
   setCalibration(model: CalibrationModel | null): void { this.calibration = model; }

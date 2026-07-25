@@ -33,13 +33,6 @@ const COLLECT_MS = 1800;          // window we actually gather frames in (longer
 const POINT_MS = SETTLE_MS + COLLECT_MS; // hard per-point duration — ALWAYS advances after this
 const COLLECT_FLOOR = 0.45;       // stricter: only keep clearly-good frames
 const SAMPLE_CAP = 60;
-const MIN_INFER_MS = 30;          // cap inference at ~30/s (a 60fps camera would otherwise burn ~80% of the main thread)
-// Confidence-aware auto-advance (vision §Calibration): a point that has already
-// banked plenty of clean samples finishes early — calibration feels fast when
-// the signal is good, without ever being able to BLOCK advancement (the hard
-// POINT_MS timer below still guarantees progress).
-const EARLY_MIN_MS = 1200;        // never leave a point before this (not rushed)
-const EARLY_SAMPLES = 18;         // clean samples that count as "enough"
 
 // --- Smooth-pursuit (moving) collection ------------------------------------
 const MOVING_PASSES = 3;
@@ -75,17 +68,11 @@ export class CalibrationController {
   private stopped = false;
   private lastConfidence = 0;
   private lastFactors: ConfidenceFactors | null = null;
-  // Inference gate: only run the (expensive) face estimate when the camera has
-  // produced a new frame, so the deterministic dot animation can run at display
-  // refresh rate and stay smooth regardless of inference cost (spec §D).
-  private lastVideoTime = -1;
-  private lastInferAt = 0;
 
   private provisional: CalibrationModel | null = null;
 
   // Moving phase.
   private movingPass = 0;
-  private passes = MOVING_PASSES; // reduced in "quick" mode
   private passStart = 0;
   private cursor: { x: number; y: number } | null = null;
   private pursuit: { cx: number; cy: number; tx: number; ty: number; t: number }[] = [];
@@ -97,8 +84,8 @@ export class CalibrationController {
     private onComplete: (model: CalibrationModel, quality: number, weak: number[]) => void
   ) {}
 
-  start(weakPointIds?: number[], mode: "full" | "quick" = "full") {
-    const all = buildGrid(mode);
+  start(weakPointIds?: number[]) {
+    const all = buildGrid();
     if (weakPointIds && weakPointIds.length) {
       this.weakOnly = weakPointIds;
       this.points = all.filter((p) => weakPointIds.includes(p.id));
@@ -106,64 +93,12 @@ export class CalibrationController {
       this.weakOnly = null;
       this.points = all;
     }
-    this.passes = mode === "quick" ? 1 : MOVING_PASSES;
     this.queue = this.points.map((_, i) => i);
     this.qi = 0; this.mode = "grid"; this.refined = false;
     this.phase = "collect"; this.pointEnteredAt = performance.now();
     this.stopped = false; this.provisional = null; this.movingPass = 0; this.pursuit.length = 0;
-    this.lastVideoTime = -1;
     this.engine.setCollecting?.(true);
     this.loop();
-  }
-
-  /** Whether to run inference this tick: the camera must have produced a new
-   * frame AND at least MIN_INFER_MS must have passed — telemetry showed a 60fps
-   * camera driving MediaPipe 60×/s at ~13ms each (~80% of the main thread),
-   * which is what made calibration feel awful even at a reported 60fps. ~30/s
-   * sampling is all the pipeline needs. Returns true (never throttles) when the
-   * video has no numeric `currentTime` — e.g. a test stub. */
-  private frameAdvanced(now: number): boolean {
-    const vt = this.video.currentTime;
-    if (typeof vt !== "number") return true;
-    if (vt === this.lastVideoTime) return false;
-    if (now - this.lastInferAt < MIN_INFER_MS) return false;
-    this.lastVideoTime = vt;
-    this.lastInferAt = now;
-    return true;
-  }
-
-  // Perf telemetry: RAF rate + inference cost, logged every ~2s so a "laggy"
-  // report comes with numbers (low raf = main-thread/GPU starvation; high infer
-  // = model cost). Only on a real video (silent in tests).
-  private perfT = 0;
-  private perfFrames = 0;
-  private perfInferN = 0;
-  private perfInferMs = 0;
-
-  private estimateTimed(now: number) {
-    const t0 = performance.now();
-    const frame = this.engine.estimate(this.video, now);
-    this.perfInferMs += performance.now() - t0;
-    this.perfInferN++;
-    return frame;
-  }
-
-  private perfTick(now: number) {
-    if (typeof this.video.currentTime !== "number") return;
-    this.perfFrames++;
-    if (!this.perfT) { this.perfT = now; return; }
-    const dt = now - this.perfT;
-    if (dt < 2000) return;
-    const raf = (this.perfFrames * 1000) / dt;
-    const inferHz = (this.perfInferN * 1000) / dt;
-    const avg = this.perfInferN ? this.perfInferMs / this.perfInferN : 0;
-    const msg = `phase=${this.phase} raf=${raf.toFixed(0)}fps infer=${inferHz.toFixed(0)}/s avg=${avg.toFixed(1)}ms`;
-    console.info(`[gaze][calib-perf] ${msg}`);
-    // Fan out to the app shell, which pipes it to the terminal via Rust (the
-    // webview console isn't visible in `tauri dev`). Keeps this core layer
-    // free of any Tauri import.
-    if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("gaze:perf", { detail: msg }));
-    this.perfT = now; this.perfFrames = 0; this.perfInferN = 0; this.perfInferMs = 0;
   }
 
   stop() { this.stopped = true; this.engine.setCollecting?.(false); cancelAnimationFrame(this.raf); }
@@ -171,7 +106,6 @@ export class CalibrationController {
   private loop = () => {
     if (this.stopped) return;
     const now = performance.now();
-    this.perfTick(now);
     if (this.phase === "collect") this.tickCollect(now);
     else if (this.phase === "moving") this.tickMoving(now);
     if (!this.stopped) this.raf = requestAnimationFrame(this.loop);
@@ -183,29 +117,21 @@ export class CalibrationController {
     if (pIndex == null) return this.afterQueue();
     const point = this.points[pIndex]!;
 
+    const frame = this.engine.estimate(this.video, now);
+    this.lastConfidence = frame.confidence;
+    this.lastFactors = frame.factors;
+
     const elapsed = now - this.pointEnteredAt;
     const collecting = elapsed >= SETTLE_MS && elapsed < POINT_MS;
-
-    // Inference (+ sample collection) only when the camera frame advanced; the
-    // dwell animation below is emitted every frame so it stays smooth.
-    if (this.frameAdvanced(now)) {
-      const frame = this.estimateTimed(now);
-      this.lastConfidence = frame.confidence;
-      this.lastFactors = frame.factors;
-      if (collecting && frame.feature && frame.confidence >= COLLECT_FLOOR && point.samples.length < SAMPLE_CAP) {
-        point.samples.push({ feature: frame.feature, confidence: frame.confidence });
-      }
+    if (collecting && frame.feature && frame.confidence >= COLLECT_FLOOR && point.samples.length < SAMPLE_CAP) {
+      point.samples.push({ feature: frame.feature, confidence: frame.confidence });
     }
 
     this.emitCollect(point, Math.min(1, elapsed / POINT_MS), collecting);
 
-    // Confidence-aware early advance (grid pass only — refine points carry
-    // samples from the first pass, so sample count there isn't fresh evidence).
-    const earlyDone = this.mode === "grid" && elapsed >= EARLY_MIN_MS && point.samples.length >= EARLY_SAMPLES;
-
     // Hard guarantee: no per-point gate. After the window we move on no matter
     // what, so a point can never trap the user.
-    if (elapsed >= POINT_MS || earlyDone) {
+    if (elapsed >= POINT_MS) {
       this.qi++; this.pointEnteredAt = now;
       if (this.qi >= this.queue.length) this.afterQueue();
     }
@@ -239,43 +165,39 @@ export class CalibrationController {
     const elapsed = now - this.passStart;
     const t = elapsed / 1000;
     const path = MOVING_PATHS[this.movingPass % MOVING_PATHS.length]!;
-    // The target's path is a pure function of time — computed EVERY frame so the
-    // dot animates at display refresh rate regardless of inference cadence.
     const tx = 0.5 + path.ax * Math.sin(t * path.fx + path.px);
     const ty = 0.5 + path.ay * Math.sin(t * path.fy + path.py);
 
-    // Inference (+ pursuit sampling) only when the camera frame advanced.
-    let following = this.isFollowing();
-    if (this.frameAdvanced(now)) {
-      const frame = this.estimateTimed(now);
-      this.lastConfidence = frame.confidence;
-      this.lastFactors = frame.factors;
-      this.cursor = null;
-      if (frame.feature && this.provisional) {
-        this.cursor = applyCalibration(this.provisional, frame.feature);
-        this.pursuit.push({ cx: this.cursor.x, cy: this.cursor.y, tx, ty, t: now });
-        while (this.pursuit.length && now - this.pursuit[0]!.t > PURSUIT_WINDOW_MS) this.pursuit.shift();
-        following = this.isFollowing();
-        if (following && frame.confidence >= COLLECT_FLOOR) {
-          // Lag compensation: pair the gaze with where the target was ~110ms ago
-          // (latest buffered path point at/older than that), since the eye trails.
-          const lagT = now - PURSUIT_LAG_MS;
-          let sx = tx, sy = ty;
-          for (const e of this.pursuit) { if (e.t <= lagT) { sx = e.tx; sy = e.ty; } }
-          this.points.push({
-            id: 1000 + this.movingPass * 100000 + Math.round(elapsed),
-            x: sx, y: sy, variation: "center",
-            samples: [{ feature: frame.feature, confidence: frame.confidence }],
-          });
-        }
+    const frame = this.engine.estimate(this.video, now);
+    this.lastConfidence = frame.confidence;
+    this.lastFactors = frame.factors;
+
+    this.cursor = null;
+    let following = false;
+    if (frame.feature && this.provisional) {
+      this.cursor = applyCalibration(this.provisional, frame.feature);
+      this.pursuit.push({ cx: this.cursor.x, cy: this.cursor.y, tx, ty, t: now });
+      while (this.pursuit.length && now - this.pursuit[0]!.t > PURSUIT_WINDOW_MS) this.pursuit.shift();
+      following = this.isFollowing();
+      if (following && frame.confidence >= COLLECT_FLOOR) {
+        // Lag compensation: pair the gaze with where the target was ~110ms ago
+        // (latest buffered path point at/older than that), since the eye trails.
+        const lagT = now - PURSUIT_LAG_MS;
+        let sx = tx, sy = ty;
+        for (const e of this.pursuit) { if (e.t <= lagT) { sx = e.tx; sy = e.ty; } }
+        this.points.push({
+          id: 1000 + this.movingPass * 100000 + Math.round(elapsed),
+          x: sx, y: sy, variation: "center",
+          samples: [{ feature: frame.feature, confidence: frame.confidence }],
+        });
       }
     }
 
     this.onProgress({
-      index: this.movingPass + 1, total: this.passes, point: null, prompt: "center",
+      index: this.movingPass + 1, total: MOVING_PASSES, point: null, prompt: "center",
       phase: "moving", dwell: 0, refining: false,
       movingPos: { x: tx, y: ty }, cursorPos: this.cursor, inRange: following, settled: following,
-      pass: this.movingPass + 1, passes: this.passes,
+      pass: this.movingPass + 1, passes: MOVING_PASSES,
       confidence: this.lastConfidence, factors: this.lastFactors,
     });
 
@@ -283,7 +205,7 @@ export class CalibrationController {
       this.refit(); // progressive: sharpen the cursor for the next sweep
       this.movingPass++;
       this.passStart = now; this.pursuit.length = 0;
-      if (this.movingPass >= this.passes) this.endMoving();
+      if (this.movingPass >= MOVING_PASSES) this.endMoving();
     }
   }
 
@@ -360,7 +282,7 @@ export class CalibrationController {
       prompt: point?.variation ?? "center",
       phase: this.phase, dwell, refining: this.mode === "refine",
       movingPos: null, cursorPos: null, inRange: false, settled: collecting,
-      pass: 0, passes: this.passes,
+      pass: 0, passes: MOVING_PASSES,
       confidence: this.lastConfidence, factors: this.lastFactors,
     });
   }

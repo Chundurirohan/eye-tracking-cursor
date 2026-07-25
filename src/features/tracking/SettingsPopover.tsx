@@ -18,7 +18,7 @@ export function SettingsPopover({ side, onClose, children }: {
 
   return (
     <Glass ref={ref} radius="lg" className="fade-enter"
-      style={{ position: "absolute", bottom: "calc(100% + 10px)", width: 320, maxWidth: "92vw", padding: "var(--s-4)", ...pos }}>
+      style={{ position: "absolute", bottom: "calc(100% + 10px)", width: 280, padding: "var(--s-4)", ...pos }}>
       {children}
     </Glass>
   );

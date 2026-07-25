@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { CalibrationController, type CalibrationProgress } from "@/core/calibration/controller";
 import type { IGazeEngine } from "@/core/engine/IGazeEngine";
-import type { CalibrationModel, HeadDirection } from "@/core/calibration/types";
+import type { CalibrationModel } from "@/core/calibration/types";
 import type { ConfidenceFactors } from "@/core/engine/types";
 import { Glass } from "@/features/shared/Glass";
 import { calibrationCoaching, type Coaching } from "./coaching";
@@ -11,23 +11,13 @@ import { confidenceLook } from "@/features/shared/confidenceColor";
 // coaching — long enough not to flicker on a brief dip.
 const COACH_AFTER_MS = 2200;
 
-const PROMPT_COPY: Record<HeadDirection, string> = {
-  center: "Look here",
-  left: "Look here — turn slightly left",
-  right: "Look here — turn slightly right",
-  up: "Look here — tilt slightly up",
-  down: "Look here — tilt slightly down",
-};
-
 export function CalibrationScene({
-  engine, video, weakPointIds, note, quick = false, onComplete, onConfidence,
+  engine, video, weakPointIds, note, onComplete, onConfidence,
 }: {
   engine: IGazeEngine;
   video: HTMLVideoElement;
   weakPointIds: number[];
   note: string | null;
-  /** Quick (3×3, single pursuit pass) vs full (5×5, three passes) calibration. */
-  quick?: boolean;
   onComplete: (model: CalibrationModel, quality: number, weak: number[]) => void;
   onConfidence?: (confidence: number) => void;
 }) {
@@ -54,9 +44,9 @@ export function CalibrationScene({
         if (now - lastConf > 100) { lastConf = now; confRef.current?.(p.confidence); }
       },
       (m, q, w) => completeRef.current(m, q, w));
-    ctrl.start(weakPointIds.length ? weakPointIds : undefined, quick ? "quick" : "full");
+    ctrl.start(weakPointIds.length ? weakPointIds : undefined);
     return () => ctrl.stop();
-  }, [engine, video, weakPointIds, quick]);
+  }, [engine, video, weakPointIds]);
 
   // Surface coaching only when there's something the user can actually fix, and
   // only after it has persisted briefly (no flicker on a momentary dip). If
@@ -90,7 +80,7 @@ export function CalibrationScene({
         )}
       </div>
 
-      {target && <Target x={target.x} y={target.y} label={PROMPT_COPY[target.variation]}
+      {target && <Target x={target.x} y={target.y}
         dwell={progress?.dwell ?? 0} collecting={!!progress?.settled}
         index={progress?.index ?? 0} total={progress?.total ?? 1} />}
       {moving && <MovingDot x={moving.x} y={moving.y} />}
@@ -171,8 +161,8 @@ function FactorChip({ label, v }: { label: string; v: number }) {
  * a fixed-size dot — NEVER per-frame width/height (layout) changes. The eased
  * left/top transition is fine HERE because a static target's position changes
  * once per point (a discrete hop), not every frame. */
-function Target({ x, y, label, dwell, collecting, index, total }:
-  { x: number; y: number; label: string; dwell: number; collecting: boolean;
+function Target({ x, y, dwell, collecting, index, total }:
+  { x: number; y: number; dwell: number; collecting: boolean;
     index: number; total: number }) {
   const scale = (34 - 16 * Math.min(1, Math.max(0, dwell))) / 34; // 1 -> ~0.53
   // A WILD, distinct color per point — golden-angle hue steps so consecutive
@@ -191,8 +181,6 @@ function Target({ x, y, label, dwell, collecting, index, total }:
         transform: `scale(${scale})`, willChange: "transform",
         boxShadow: collecting ? `0 0 22px ${color}` : `0 0 12px ${color}`,
         transition: "box-shadow var(--dur-fast)" }} />
-      {label && <div style={{ position: "absolute", top: 34, left: "50%", transform: "translateX(-50%)",
-        whiteSpace: "nowrap", fontSize: 13, color: "var(--text-2)" }}>{label}</div>}
     </div>
   );
 }
