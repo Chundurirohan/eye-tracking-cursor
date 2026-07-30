@@ -37,6 +37,12 @@ const SCROLL_TICK_MS = 40;  // scroll cadence
 const SCROLL_STEP = 34;     // pixels per tick
 const STICKY_MARGIN = 1.35;    // once dwelling, keep the target until gaze leaves
                                // its bounds by this × the snap radius (no jitter-flip)
+// Magnet-fatigue: if you keep approaching a snap target and looking away without
+// clicking it (a stubborn neighbor stealing the cursor from what you actually
+// want), suppress it so it stops grabbing you until your next click lands.
+const REJECT_MIN_PROG = 0.12;  // the dwell must have started for a leave to count
+const REJECT_WINDOW = 4500;    // ms — rejections must cluster in time to count
+const REJECT_COUNT = 2;        // this many rejections → suppress the target
 const SMALL_TARGET = 0.11;     // only auto-learn drift from targets smaller than this
                                // (normalized), where the gaze was genuinely on it
 const CONF_RADIUS_GAIN = 0.4;  // low confidence widens the snap radius by up to this
@@ -50,15 +56,21 @@ type P = { x: number; y: number };
 
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 
+/** A coarse position key (normalized center → ~2% grid) used to identify a snap
+ * target across frames for magnet-fatigue, since native targets have no ID. */
+const keyOf = (nx: number, ny: number) => `${Math.round(nx * 50)},${Math.round(ny * 50)}`;
+
 /** Nearest clickable in THIS app within `limit` px of (px,py), biased toward the
  * one your gaze is MOVING toward (intent) so dense toolbars resolve the way you
  * mean. `vx,vy` are the normalized gaze velocity components (0,0 = at rest). */
-function nearestClickable(px: number, py: number, limit: number, vx: number, vy: number): HTMLElement | null {
+function nearestClickable(px: number, py: number, limit: number, vx: number, vy: number, suppressed: Set<string>): HTMLElement | null {
   const vmag = Math.hypot(vx, vy);
   let best: HTMLElement | null = null, bestScore = limit;
   document.querySelectorAll<HTMLElement>(CLICKABLE).forEach((el) => {
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return;
+    // Magnet-fatigue: ignore a target you keep rejecting.
+    if (suppressed.size && suppressed.has(keyOf((r.left + r.width / 2) / window.innerWidth, (r.top + r.height / 2) / window.innerHeight))) return;
     const dx = Math.max(r.left - px, 0, px - r.right);
     const dy = Math.max(r.top - py, 0, py - r.bottom);
     const d = Math.hypot(dx, dy);
@@ -82,10 +94,11 @@ type NativeTarget = { x: number; y: number; w: number; h: number };
 /** Nearest system-wide clickable (from the scanner cache) within `limit`
  * NORMALIZED units of (px,py), intent-biased toward gaze motion. All coords are
  * normalized to window content. Returns the target (center + size) or null. */
-function nearestNativeTarget(px: number, py: number, limit: number, vx: number, vy: number, list: NativeTarget[]): NativeTarget | null {
+function nearestNativeTarget(px: number, py: number, limit: number, vx: number, vy: number, list: NativeTarget[], suppressed: Set<string>): NativeTarget | null {
   const vmag = Math.hypot(vx, vy);
   let best: NativeTarget | null = null, bestScore = limit;
   for (const t of list) {
+    if (suppressed.size && suppressed.has(keyOf(t.x, t.y))) continue; // magnet-fatigue
     const dx = Math.max(Math.abs(px - t.x) - t.w / 2, 0);
     const dy = Math.max(Math.abs(py - t.y) - t.h / 2, 0);
     const d = Math.hypot(dx, dy);
@@ -170,6 +183,11 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
   const scrollDwellRef = useRef(0); // when gaze entered a scroll band
   const lastScrollRef = useRef(0);
   const progressRef = useRef(0); // live dwell progress, to lock the target mid-commit
+  // Magnet-fatigue state: rejection counts + the currently-suppressed targets, and
+  // the snap target from the previous frame (to detect an abandoned dwell).
+  const rejectRef = useRef<Map<string, { count: number; t: number }>>(new Map());
+  const suppressRef = useRef<Set<string>>(new Set());
+  const lastSnapRef = useRef<string | null>(null); // snap-target key from the last frame
 
   useEffect(() => {
     const onGaze = (e: Event) => { posRef.current = (e as CustomEvent<P>).detail; lastGazeRef.current = performance.now(); };
@@ -199,6 +217,9 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
       lastClickRef.current = now; dwellStartRef.current = now; setProgress(0);
       setFlash(true); setRipple({ x: sx, y: sy, id: now });
       window.setTimeout(() => setFlash(false), 200);
+      // The click is done → lift magnet-fatigue suppression (per the spec: suppress
+      // only until the following click lands) and reset rejection tracking.
+      suppressRef.current.clear(); rejectRef.current.clear(); lastSnapRef.current = null;
     };
     const tick = () => {
       raf = requestAnimationFrame(tick);
@@ -229,7 +250,7 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
       const conf = clamp01(confRef.current ?? 0);
       const radiusN = SNAP_FRAC * (1 + CONF_RADIUS_GAIN * (1 - conf)); // normalized snap radius
       const radiusPx = radiusN * Math.min(window.innerWidth, window.innerHeight);
-      let target = nearestClickable(px, py, radiusPx, vx, vy);
+      let target = nearestClickable(px, py, radiusPx, vx, vy, suppressRef.current);
 
       // Sticky commit: once a dwell has begun, keep the SAME target even if gaze
       // jitter makes a neighbor momentarily nearest — only release when the gaze
@@ -260,12 +281,35 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
           const dy = Math.max(Math.abs(p.y - cur.y) - cur.h / 2, 0);
           if (Math.hypot(dx, dy) < radiusN * STICKY_MARGIN) keep = true;
         }
-        const hit = keep ? cur : nearestNativeTarget(p.x, p.y, radiusN, vx, vy, nativeListRef.current);
+        const hit = keep ? cur : nearestNativeTarget(p.x, p.y, radiusN, vx, vy, nativeListRef.current, suppressRef.current);
         nativeHitRef.current = hit;
         if (hit) nativeSnap = { x: hit.x, y: hit.y };
       } else {
         nativeHitRef.current = null;
       }
+
+      // Magnet-fatigue bookkeeping. `progressRef.current` still holds LAST frame's
+      // dwell on LAST frame's snap target (branches below mutate it). If the snap
+      // target changed while a dwell was underway, the previous one was abandoned
+      // → count a rejection; two rejections suppress it until the next click.
+      let curKey: string | null = null;
+      if (target) {
+        const rr = target.getBoundingClientRect();
+        curKey = keyOf((rr.left + rr.width / 2) / window.innerWidth, (rr.top + rr.height / 2) / window.innerHeight);
+      } else if (nativeSnap && nativeHitRef.current) {
+        curKey = keyOf(nativeHitRef.current.x, nativeHitRef.current.y);
+      }
+      if (lastSnapRef.current && lastSnapRef.current !== curKey && progressRef.current >= REJECT_MIN_PROG) {
+        const k = lastSnapRef.current;
+        const rj = rejectRef.current.get(k);
+        if (rj && now - rj.t < REJECT_WINDOW) {
+          rj.count++; rj.t = now;
+          if (rj.count >= REJECT_COUNT) suppressRef.current.add(k);
+        } else {
+          rejectRef.current.set(k, { count: 1, t: now });
+        }
+      }
+      lastSnapRef.current = curKey;
 
       // Reticle + OS cursor position: a magnetic GRAVITY WELL toward a nearby
       // control's center — continuous (pulls harder the closer you are), released
@@ -326,11 +370,13 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
         setRect(r);
         if (target !== targetRef.current) { targetRef.current = target; dwellStartRef.current = now; }
         if (target === armedElRef.current) { setProgress(0); progressRef.current = 0; return; }
-        // Per-element dwell override (e.g. keyboard keys dwell faster). The
-        // armedEl guard above already blocks re-firing the SAME key until you look
-        // away, so a short dwell can't double-type.
+        // Per-element dwell override (e.g. keyboard keys) + optional SETTLE gate:
+        // the fill only begins after the gaze has rested on the element for
+        // `data-dwell-settle` ms, so keys you merely pass over never fire. The
+        // armedEl guard above already blocks re-firing the SAME element.
         const dwellMs = Number(target.dataset.dwellMs) || DWELL_MS;
-        const prog = Math.min(1, (now - dwellStartRef.current) / dwellMs);
+        const settleMs = Number(target.dataset.dwellSettle) || 0;
+        const prog = Math.min(1, Math.max(0, now - dwellStartRef.current - settleMs) / dwellMs);
         setProgress(prog); progressRef.current = prog;
         if (prog >= 1 && canClick) {
           target.click(); armedElRef.current = target; armedPosRef.current = null;
@@ -344,7 +390,8 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
         // on empty space → just the reticle" holds EVERYWHERE. Skip absurdly large
         // hits (containers, not buttons); the reticle carries those.
         const nt = nativeHitRef.current;
-        if (nativeSnap && nt && nt.w < 0.6 && nt.h < 0.6) {
+        // Draw the box for wide targets too (search bars); filter mainly on height.
+        if (nativeSnap && nt && nt.h < 0.4 && nt.w < 0.98) {
           const rw = nt.w * window.innerWidth, rh = nt.h * window.innerHeight;
           setRect(new DOMRect(nt.x * window.innerWidth - rw / 2, nt.y * window.innerHeight - rh / 2, rw, rh));
         } else {

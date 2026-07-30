@@ -90,6 +90,26 @@ export async function nativeTargets(): Promise<[number, number, number, number][
   }
 }
 
+/** Toggle the macOS built-in Zoom magnifier on/off (⌥⌘8). The magnifier follows
+ * the system pointer, which the app drives to the gaze reticle. Requires "Use
+ * keyboard shortcuts to zoom" enabled in System Settings › Accessibility › Zoom. */
+export function zoomToggle(): void {
+  if (!inTauri) return;
+  void invoke("zoom_toggle").catch(() => {});
+}
+
+/** Zoom the macOS magnifier in one step (⌥⌘=). */
+export function zoomIn(): void {
+  if (!inTauri) return;
+  void invoke("zoom_in").catch(() => {});
+}
+
+/** Zoom the macOS magnifier out one step (⌥⌘-). */
+export function zoomOut(): void {
+  if (!inTauri) return;
+  void invoke("zoom_out").catch(() => {});
+}
+
 /** Type a Unicode string into the focused app (on-screen keyboard). */
 export function typeText(text: string): void {
   if (!inTauri) return;

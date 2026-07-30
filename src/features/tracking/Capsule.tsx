@@ -11,7 +11,7 @@ const STATUS_COLOR: Partial<Record<AppState, string>> = {
 };
 
 export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrate, settingsSlot,
-  keyboardOn = false, onToggleKeyboard }: {
+  keyboardOn = false, onToggleKeyboard, zoomOn = false, onToggleZoom }: {
   state: AppState;
   side: "left" | "right" | "center";
   armed?: boolean;
@@ -21,6 +21,9 @@ export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrat
   /** On-screen keyboard toggle (dwell-clickable). */
   keyboardOn?: boolean;
   onToggleKeyboard?: () => void;
+  /** macOS Zoom magnifier toggle (dwell-clickable). */
+  zoomOn?: boolean;
+  onToggleZoom?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const paused = state === "paused";
@@ -28,13 +31,15 @@ export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrat
     side === "left" ? { left: "var(--s-5)" } : side === "right" ? { right: "var(--s-5)" }
       : { left: "50%", transform: "translateX(-50%)" };
   // The control bar is large by default so its buttons are easy dwell-click
-  // targets with imperfect gaze accuracy.
-  const s = 1.5;
+  // targets with imperfect gaze accuracy. Bumped up because tightly-packed small
+  // icons were indistinguishable to gaze — a look at Pause/Settings could snap to
+  // the neighbouring keyboard toggle ("buttons open the keyboard" bug).
+  const s = 1.8;
 
   return (
     <div style={{ position: "absolute", bottom: "var(--s-5)", zIndex: 10, ...pos }}>
       {open && <SettingsPopover side={side} onClose={() => setOpen(false)}>{settingsSlot}</SettingsPopover>}
-      <Glass radius="pill" style={{ display: "flex", alignItems: "center", gap: 8 * s, padding: `${8 * s}px ${10 * s}px ${8 * s}px ${14 * s}px`,
+      <Glass radius="pill" style={{ display: "flex", alignItems: "center", gap: 11 * s, padding: `${8 * s}px ${10 * s}px ${8 * s}px ${14 * s}px`,
         transition: "padding var(--dur-med) var(--ease-soft)" }}>
         <span style={{ width: 8 * s, height: 8 * s, borderRadius: 999, background: STATUS_COLOR[state] ?? "var(--text-3)",
           boxShadow: state === "tracking" ? "0 0 8px var(--good)" : "none", transition: "background var(--dur-med)" }} />
@@ -48,11 +53,18 @@ export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrat
         <span style={{ width: 1, height: 18 * s, background: "var(--stroke)" }} />
         <IconBtn size={s} label={paused ? "Resume" : "Pause"} onClick={onPauseToggle}>{paused ? "▶" : "❙❙"}</IconBtn>
         <IconBtn size={s} label="Recalibrate" onClick={onRecalibrate}>⟳</IconBtn>
+        <IconBtn size={s} label="Settings" onClick={() => setOpen((o) => !o)}>⚙</IconBtn>
+        {(onToggleKeyboard || onToggleZoom) && (
+          <span style={{ width: 1, height: 22 * s, background: "var(--stroke)" }} />
+        )}
+        {onToggleZoom && (
+          <IconBtn size={s} label={zoomOn ? "Turn off magnifier" : "Magnifier (zoom around reticle)"}
+            active={zoomOn} onClick={onToggleZoom}>🔍</IconBtn>
+        )}
         {onToggleKeyboard && (
           <IconBtn size={s} label={keyboardOn ? "Hide keyboard" : "On-screen keyboard"}
             active={keyboardOn} onClick={onToggleKeyboard}>⌨</IconBtn>
         )}
-        <IconBtn size={s} label="Settings" onClick={() => setOpen((o) => !o)}>⚙</IconBtn>
       </Glass>
     </div>
   );
@@ -61,7 +73,7 @@ export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrat
 function IconBtn({ children, label, onClick, size = 1, active = false }: { children: React.ReactNode; label: string; onClick: () => void; size?: number; active?: boolean }) {
   return (
     <button data-dwell onClick={onClick} title={label} aria-label={label}
-      style={{ width: 30 * size, height: 30 * size, borderRadius: 999, fontSize: 13 * size, display: "grid", placeItems: "center",
+      style={{ width: 34 * size, height: 34 * size, borderRadius: 999, fontSize: 14 * size, display: "grid", placeItems: "center",
         background: active ? "var(--accent-soft)" : "transparent",
         color: active ? "var(--accent)" : "var(--text-2)",
         transition: "background var(--dur-fast), color var(--dur-fast), width var(--dur-med), height var(--dur-med)" }}

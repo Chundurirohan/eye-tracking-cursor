@@ -13,7 +13,7 @@ import { LandmarkOverlay } from "@/features/diagnostics/LandmarkOverlay";
 import { ConfidenceMeter } from "@/features/shared/ConfidenceMeter";
 import { Toggle } from "@/features/shared/Toggle";
 import { useHotkeys } from "@/features/shared/useHotkeys";
-import { setClickThrough, nativeClick, dispatchAction, isTrusted } from "@/core/system/nativeInput";
+import { setClickThrough, nativeClick, dispatchAction, isTrusted, zoomToggle } from "@/core/system/nativeInput";
 import { RadialMenu } from "@/features/tracking/RadialMenu";
 import { OnScreenKeyboard } from "@/features/tracking/OnScreenKeyboard";
 import { PoseAdaptiveCorrector } from "@/core/engine/adaptation";
@@ -41,6 +41,9 @@ function Inner() {
   // Radial action menu: the normalized gaze point where it's anchored, or null.
   const [actionMenu, setActionMenu] = useState<{ nx: number; ny: number } | null>(null);
   const [showKeyboard, setShowKeyboard] = useState(false);
+  // macOS Zoom magnifier on/off (we track it locally since the OS state isn't
+  // queryable; our toggle is the only source that flips it).
+  const [zoomOn, setZoomOn] = useState(false);
   // Whether the keyboard is up because a text field auto-triggered it (vs. a
   // manual toggle) — so auto-hide only reverses an auto-show, never fights the user.
   const keyboardAutoRef = useRef(false);
@@ -428,6 +431,8 @@ function Inner() {
           onRecalibrate={() => send({ type: "START_RECALIBRATION", weakPointIds: [] })}
           keyboardOn={showKeyboard}
           onToggleKeyboard={() => { keyboardAutoRef.current = false; setShowKeyboard((v) => !v); }}
+          zoomOn={zoomOn}
+          onToggleZoom={() => { zoomToggle(); setZoomOn((v) => !v); }}
           settingsSlot={<SettingsPanel onToggleDiagnostics={() => setShowDiag((s) => !s)} showDiag={showDiag} />}
         />
       )}

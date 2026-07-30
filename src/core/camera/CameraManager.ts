@@ -59,23 +59,32 @@ export class CameraManager {
   private emit(e: Parameters<Listener>[0]) { this.listeners.forEach((l) => l(e)); }
 
   async requestPermissionAndStart(): Promise<void> {
-    // Initial request also unlocks device labels for enumerateDevices().
-    let stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
-      audio: false,
-    });
+    // Initial request is MAXIMALLY PERMISSIVE (`video: true`) — no width/height/
+    // facingMode constraints that a webcam could fail to satisfy. WebKit (WKWebView)
+    // has reported "no device was found amongst 1 devices" when even ideal
+    // constraints race a freshly-(re)granted Camera permission; a bare request can't
+    // be rejected by constraints, so it succeeds if the device exists at all. This
+    // also unlocks device labels for enumerateDevices().
+    let stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
 
     // On macOS, getUserMedia often defaults to the iPhone Continuity Camera,
     // which delivers black frames (no error) when the phone isn't actively
-    // streaming. Prefer a real built-in webcam if one is available.
+    // streaming. Prefer a real built-in webcam if one is available, and only NOW
+    // apply the resolution hint (as `ideal`, still non-rejecting).
     const preferred = await pickPreferredCamera();
     const current = stream.getVideoTracks()[0]?.getSettings().deviceId;
     if (preferred && preferred !== current) {
       stream.getTracks().forEach((t) => t.stop());
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, deviceId: { exact: preferred } },
-        audio: false,
-      });
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, deviceId: { exact: preferred } },
+          audio: false,
+        });
+      } catch {
+        // If the preferred device can't be opened exactly, fall back to any camera
+        // rather than failing the whole start.
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      }
     }
     this.attach(stream);
   }

@@ -63,7 +63,7 @@ fn clear_session(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 mod mac_input {
     use core_graphics::event::{
-        CGEvent, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
+        CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
     };
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::geometry::CGPoint;
@@ -173,6 +173,23 @@ mod mac_input {
         Ok(())
     }
 
+    /// Post a key chord (modifier flags + keycode) as a real keystroke — used to
+    /// drive the macOS built-in Zoom via its keyboard shortcuts (⌥⌘8 toggle, ⌥⌘=
+    /// in, ⌥⌘- out). Requires "Use keyboard shortcuts to zoom" enabled in
+    /// System Settings › Accessibility › Zoom.
+    pub fn key_combo(flags_raw: u64, code: u16) -> Result<(), String> {
+        let flags = CGEventFlags::from_bits_truncate(flags_raw);
+        let d = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| "event source".to_string())?;
+        let down = CGEvent::new_keyboard_event(d, code as CGKeyCode, true).map_err(|_| "key event".to_string())?;
+        down.set_flags(flags);
+        down.post(CGEventTapLocation::HID);
+        let u = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| "event source".to_string())?;
+        let up = CGEvent::new_keyboard_event(u, code as CGKeyCode, false).map_err(|_| "key event".to_string())?;
+        up.set_flags(flags);
+        up.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
     /// Current global cursor position in logical points (top-left origin). The
     /// background target scanner scans around this (the cursor tracks the gaze
     /// while armed), so magnetism never waits on a synchronous per-frame query.
@@ -193,6 +210,7 @@ mod mac_input {
 #[cfg(target_os = "macos")]
 mod mac_ax {
     use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+    use core_foundation::boolean::CFBoolean;
     use core_foundation::string::{CFString, CFStringRef};
     use core_graphics::geometry::{CGPoint, CGSize};
     use std::os::raw::c_void;
@@ -212,6 +230,34 @@ mod mac_ax {
         ) -> i32;
         fn AXUIElementGetPid(el: AXUIElementRef, pid: *mut i32) -> i32;
         fn AXValueGetValue(value: CFTypeRef, the_type: u32, out: *mut c_void) -> bool;
+        fn AXUIElementSetAttributeValue(el: AXUIElementRef, attr: CFStringRef, value: CFTypeRef) -> i32;
+        fn AXUIElementCopyActionNames(el: AXUIElementRef, names: *mut core_foundation::array::CFArrayRef) -> i32;
+    }
+
+    /// Whether an element exposes an interactive ACTION (AXPress / AXOpen /
+    /// AXConfirm / AXShowMenu). This is the semantic "is this actually clickable"
+    /// signal every element that can be pressed advertises — far more universal
+    /// than guessing from role names, so the magnet catches buttons, links, icons,
+    /// table rows, toolbar items, etc. that role-whitelisting misses.
+    unsafe fn has_press_action(el: AXUIElementRef) -> bool {
+        use core_foundation::array::{CFArray, CFArrayRef};
+        use core_foundation::string::CFString;
+        let mut arr: CFArrayRef = std::ptr::null();
+        if AXUIElementCopyActionNames(el, &mut arr) != 0 || arr.is_null() { return false; }
+        let names: CFArray<CFString> = CFArray::wrap_under_create_rule(arr);
+        names.iter().any(|n| {
+            let s = n.to_string();
+            s == "AXPress" || s == "AXOpen" || s == "AXConfirm" || s == "AXShowMenu" || s == "AXPick"
+        })
+    }
+
+    /// Force Chromium/Electron apps (Chrome, VS Code, Slack, Electron, …) to build
+    /// their accessibility tree so their WEB CONTENT becomes hit-testable — they
+    /// lazily skip it until an assistive client asks via `AXManualAccessibility`.
+    /// Without this the magnet finds nothing over web/Electron UI. Cheap + idempotent.
+    pub unsafe fn enable_app_a11y(app: AXUIElementRef) {
+        let attr = CFString::new("AXManualAccessibility");
+        AXUIElementSetAttributeValue(app, attr.as_concrete_TypeRef(), CFBoolean::true_value().as_CFTypeRef());
     }
 
     fn is_clickable(role: &str) -> bool {
@@ -220,6 +266,9 @@ mod mac_ax {
             "AXButton" | "AXLink" | "AXMenuItem" | "AXMenuButton" | "AXPopUpButton"
                 | "AXCheckBox" | "AXRadioButton" | "AXTextField" | "AXComboBox"
                 | "AXTabButton" | "AXMenuBarItem" | "AXDisclosureTriangle" | "AXSearchField"
+                // Text-entry roles (search bars, address bars, editors) that let you
+                // click to place the caret but don't advertise a press action.
+                | "AXTextArea"
         )
     }
 
@@ -289,18 +338,21 @@ mod mac_ax {
 
     /// Walk from `start` up to a nearby actionable ancestor; return its global
     /// rect center + size in logical points. `start` is owned by the caller.
+    /// An element counts as actionable if it either has a known interactive role
+    /// (covers text fields / search bars, which don't expose a press action) OR
+    /// advertises a press action (covers everything else — universal coverage).
     unsafe fn actionable_rect(start: AXUIElementRef) -> Option<(f64, f64, f64, f64)> {
         let mut cur = start;
         let mut owned: Option<AXUIElementRef> = None;
         let mut result = None;
-        for _ in 0..4 {
-            if let Some(role) = ax_role(cur) {
-                if is_clickable(&role) {
-                    if let (Some(p), Some(s)) = (ax_point(cur), ax_size(cur)) {
-                        if s.width > 1.0 && s.height > 1.0 {
-                            result = Some((p.x + s.width / 2.0, p.y + s.height / 2.0, s.width, s.height));
-                            break;
-                        }
+        for _ in 0..6 {
+            let clickable = ax_role(cur).map(|r| is_clickable(&r)).unwrap_or(false)
+                || has_press_action(cur);
+            if clickable {
+                if let (Some(p), Some(s)) = (ax_point(cur), ax_size(cur)) {
+                    if s.width > 1.0 && s.height > 1.0 {
+                        result = Some((p.x + s.width / 2.0, p.y + s.height / 2.0, s.width, s.height));
+                        break;
                     }
                 }
             }
@@ -341,6 +393,7 @@ mod mac_ax {
         CFRelease(sys as CFTypeRef);
         let app = match app { Some(a) => a as AXUIElementRef, None => return None };
         if same_pid(app, my_pid) { CFRelease(app as CFTypeRef); return None; }
+        enable_app_a11y(app); // make Chromium/Electron web content hit-testable
 
         let mut best: Option<(f64, f64, f64, f64, f64)> = None; // (dist, cx, cy, w, h)
         for (ox, oy) in probe_offsets(radius) {
@@ -370,6 +423,7 @@ mod mac_ax {
         CFRelease(sys as CFTypeRef);
         let app = match app { Some(a) => a as AXUIElementRef, None => return out };
         if same_pid(app, my_pid) { CFRelease(app as CFTypeRef); return out; }
+        enable_app_a11y(app); // make Chromium/Electron web content hit-testable
 
         // Dense grid: step ~36pt catches small toolbar buttons without exploding
         // the probe count. Bounded so a huge radius can't stall the scan thread.
@@ -384,8 +438,11 @@ mod mac_ax {
                 if err != 0 || el.is_null() { continue; }
                 if let Some((cx, cy, w, h)) = actionable_rect(el) {
                     // Dedup by center proximity (the grid hits the same button many
-                    // times) and drop absurdly large hits (containers, not buttons).
-                    if w < 600.0 && h < 600.0
+                    // times) and drop container-sized hits. Filter mainly on HEIGHT:
+                    // real clickables (buttons, search bars, menu items) are short but
+                    // can be WIDE — a wide Google search bar was being wrongly excluded
+                    // by a symmetric 600px cap.
+                    if h < 220.0 && w < 1600.0
                         && !out.iter().any(|&(ex, ey, _, _)| (ex - cx).abs() < 6.0 && (ey - cy).abs() < 6.0)
                     {
                         out.push((cx, cy, w, h));
@@ -455,7 +512,7 @@ fn nearby_targets(window: tauri::WebviewWindow, state: tauri::State<TargetCache>
 fn spawn_target_scanner(cache: std::sync::Arc<std::sync::Mutex<Vec<(f64, f64, f64, f64)>>>) {
     let my_pid = std::process::id() as i32;
     std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_millis(90));
+        std::thread::sleep(std::time::Duration::from_millis(120));
         if let Some((gx, gy)) = mac_input::cursor_location() {
             let targets = unsafe { mac_ax::all_targets(gx, gy, 200.0, my_pid) };
             if let Ok(mut c) = cache.lock() { *c = targets; }
@@ -476,6 +533,40 @@ fn to_global(window: &tauri::WebviewWindow, nx: f64, ny: f64) -> Result<(f64, f6
     let gx = (pos.x as f64 + nx * size.width as f64) / scale;
     let gy = (pos.y as f64 + ny * size.height as f64) / scale;
     Ok((gx, gy))
+}
+
+// macOS built-in Zoom keyboard shortcuts (Command+Option chords). The magnifier
+// follows the system pointer, which the app drives to the gaze reticle — so this
+// gives a live, GPU-accelerated magnifier around where you're looking. Requires
+// "Use keyboard shortcuts to zoom" enabled in System Settings › Accessibility › Zoom.
+#[cfg(target_os = "macos")]
+const CMD_ALT: u64 = 0x0010_0000 | 0x0008_0000; // Command | Alternate(Option)
+
+/// Toggle the macOS Zoom magnifier on/off (⌥⌘8).
+#[tauri::command]
+fn zoom_toggle() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    { mac_input::key_combo(CMD_ALT, 28) } // 28 = key "8"
+    #[cfg(not(target_os = "macos"))]
+    { Err("macOS Zoom is macOS-only".into()) }
+}
+
+/// Zoom in one step (⌥⌘=).
+#[tauri::command]
+fn zoom_in() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    { mac_input::key_combo(CMD_ALT, 24) } // 24 = key "="
+    #[cfg(not(target_os = "macos"))]
+    { Err("macOS Zoom is macOS-only".into()) }
+}
+
+/// Zoom out one step (⌥⌘-).
+#[tauri::command]
+fn zoom_out() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    { mac_input::key_combo(CMD_ALT, 27) } // 27 = key "-"
+    #[cfg(not(target_os = "macos"))]
+    { Err("macOS Zoom is macOS-only".into()) }
 }
 
 /// Move the OS cursor to a gaze point (normalized to the window content).
@@ -677,6 +768,15 @@ pub fn run() {
             // trusted, so the app gets registered/granted properly.
             #[cfg(target_os = "macos")]
             { let _ = prompt_accessibility(); }
+            // Log the ACTUAL Accessibility state so we can see, not guess, whether
+            // this binary is trusted (dev rebuilds get a new signature, so a prior
+            // grant may not apply). Look for this line at startup.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                let ax = AXIsProcessTrusted();
+                println!("[gaze][perms] Accessibility(magnet/clicks/zoom)={ax}");
+                if !ax { println!("[gaze][perms] -> OFF: enable this binary in System Settings › Privacy & Security › Accessibility, then relaunch."); }
+            }
             // Auto-show the on-screen keyboard when a text field takes focus.
             #[cfg(target_os = "macos")]
             spawn_text_focus_watcher(app.handle().clone());
@@ -697,6 +797,9 @@ pub fn run() {
             set_click_through,
             snap_target,
             nearby_targets,
+            zoom_toggle,
+            zoom_in,
+            zoom_out,
             type_text,
             key_tap,
             is_trusted,
