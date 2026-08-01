@@ -425,31 +425,37 @@ mod mac_ax {
         if same_pid(app, my_pid) { CFRelease(app as CFTypeRef); return out; }
         enable_app_a11y(app); // make Chromium/Electron web content hit-testable
 
-        // Dense grid: step ~36pt catches small toolbar buttons without exploding
-        // the probe count. Bounded so a huge radius can't stall the scan thread.
-        let step = 36.0_f64;
-        let n = ((radius / step) as i32).clamp(1, 6);
-        for iy in -n..=n {
-            for ix in -n..=n {
-                let px = gx + ix as f64 * step;
-                let py = gy + iy as f64 * step;
-                let mut el: AXUIElementRef = std::ptr::null();
-                let err = AXUIElementCopyElementAtPosition(app, px as f32, py as f32, &mut el);
-                if err != 0 || el.is_null() { continue; }
-                if let Some((cx, cy, w, h)) = actionable_rect(el) {
-                    // Dedup by center proximity (the grid hits the same button many
-                    // times) and drop container-sized hits. Filter mainly on HEIGHT:
-                    // real clickables (buttons, search bars, menu items) are short but
-                    // can be WIDE — a wide Google search bar was being wrongly excluded
-                    // by a symmetric 600px cap.
-                    if h < 220.0 && w < 1600.0
-                        && !out.iter().any(|&(ex, ey, _, _)| (ex - cx).abs() < 6.0 && (ey - cy).abs() < 6.0)
-                    {
-                        out.push((cx, cy, w, h));
+        // Two-tier grid. A COARSE outer grid (~34pt) covers the whole magnet
+        // radius for normal buttons/search bars. A FINE inner grid (~12pt) sweeps
+        // the small region right around the gaze so TINY controls — the close-tab
+        // ×, small toolbar icons — are actually landed on: a 36pt step steps clean
+        // over a 16px button, which is exactly why the × wasn't being detected.
+        // Bounded (node cap + clamped counts) so it can't stall the scan thread.
+        let passes: [(f64, f64); 2] = [(60.0, 12.0), (radius, 34.0)];
+        for (reach, step) in passes {
+            let n = ((reach / step) as i32).clamp(1, 8);
+            for iy in -n..=n {
+                for ix in -n..=n {
+                    let px = gx + ix as f64 * step;
+                    let py = gy + iy as f64 * step;
+                    let mut el: AXUIElementRef = std::ptr::null();
+                    let err = AXUIElementCopyElementAtPosition(app, px as f32, py as f32, &mut el);
+                    if err != 0 || el.is_null() { continue; }
+                    if let Some((cx, cy, w, h)) = actionable_rect(el) {
+                        // Dedup by center proximity (the grid hits the same button
+                        // many times) and drop container-sized hits. Filter mainly on
+                        // HEIGHT: real clickables (buttons, search bars, menu items)
+                        // are short but can be WIDE — a wide Google search bar was
+                        // being wrongly excluded by a symmetric 600px cap.
+                        if h < 220.0 && w < 1600.0
+                            && !out.iter().any(|&(ex, ey, _, _)| (ex - cx).abs() < 6.0 && (ey - cy).abs() < 6.0)
+                        {
+                            out.push((cx, cy, w, h));
+                        }
                     }
+                    CFRelease(el as CFTypeRef);
+                    if out.len() >= 80 { CFRelease(app as CFTypeRef); return out; }
                 }
-                CFRelease(el as CFTypeRef);
-                if out.len() >= 48 { CFRelease(app as CFTypeRef); return out; }
             }
         }
         CFRelease(app as CFTypeRef);
