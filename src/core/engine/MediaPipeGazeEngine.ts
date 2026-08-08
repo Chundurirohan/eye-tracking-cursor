@@ -39,13 +39,18 @@ export class MediaPipeGazeEngine implements IGazeEngine {
 
   async init(): Promise<void> {
     if (this.landmarker) return;
-    const fileset = await FilesetResolver.forVisionTasks(
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-    );
+    // Vendored locally by `scripts/setup-assets.mjs` and shipped in the bundle.
+    //
+    // These were previously fetched from a CDN on every launch. That made the app
+    // require an internet connection to do anything, and — because the webview
+    // holds the full native IPC bridge and the app holds Accessibility — it meant
+    // a CDN compromise could execute code with cursor and keyboard control of the
+    // user's machine. Loading from the bundle removes that path entirely and is
+    // what the strict CSP in tauri.conf.json now enforces.
+    const fileset = await FilesetResolver.forVisionTasks("/mediapipe/wasm");
     this.landmarker = await FaceLandmarker.createFromOptions(fileset, {
       baseOptions: {
-        modelAssetPath:
-          "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        modelAssetPath: "/mediapipe/face_landmarker.task",
         delegate: "GPU",
       },
       runningMode: "VIDEO",

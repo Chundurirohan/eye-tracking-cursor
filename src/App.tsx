@@ -13,7 +13,7 @@ import { LandmarkOverlay } from "@/features/diagnostics/LandmarkOverlay";
 import { ConfidenceMeter } from "@/features/shared/ConfidenceMeter";
 import { Toggle } from "@/features/shared/Toggle";
 import { useHotkeys } from "@/features/shared/useHotkeys";
-import { setClickThrough, nativeClick, dispatchAction, isTrusted, zoomToggle, screenInfo } from "@/core/system/nativeInput";
+import { setClickThrough, nativeClick, dispatchAction, isTrusted, zoomToggle, screenInfo, devLog } from "@/core/system/nativeInput";
 import { RadialMenu } from "@/features/tracking/RadialMenu";
 import { OnScreenKeyboard } from "@/features/tracking/OnScreenKeyboard";
 import { PoseAdaptiveCorrector } from "@/core/engine/adaptation";
@@ -133,10 +133,16 @@ function Inner() {
     try {
       await cameraRef.current!.requestPermissionAndStart();
       await engineRef.current!.init();
+      // Surfaced to stdout because a release build has no console: this is the
+      // one line proving the camera opened AND the MediaPipe WASM/model loaded
+      // from the bundle under the strict CSP. If assets or CSP were wrong, the
+      // catch below fires instead and says so.
+      devLog("engine ready — camera + MediaPipe loaded from bundle");
       setCamLive(true);
       patchSaved({ permissionGranted: true });
       send({ type: "PERMISSION_GRANTED" });
     } catch (err) {
+      devLog(`engine init FAILED: ${err instanceof Error ? err.message : String(err)}`);
       console.error("[gaze] camera/engine init failed:", err);
       send({ type: "PERMISSION_DENIED", reason: describeCameraError(err) });
     }

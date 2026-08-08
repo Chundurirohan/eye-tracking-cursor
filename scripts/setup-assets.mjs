@@ -15,6 +15,11 @@ const outWasm = join(root, "public", "mediapipe", "wasm");
 const outModel = join(root, "public", "mediapipe", "face_landmarker.task");
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+// Pose model for the diagnostics skeleton view. Vendored too, so the shipped app
+// makes NO network requests at runtime — see MediaPipeGazeEngine.init().
+const outPose = join(root, "public", "mediapipe", "pose_landmarker.task");
+const POSE_URL =
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 
 function copyWasm() {
   if (!existsSync(wasmSrc)) {
@@ -26,21 +31,25 @@ function copyWasm() {
   console.log("[assets] wasm vendored");
 }
 
-async function fetchModel() {
-  if (existsSync(outModel)) return;
-  mkdirSync(dirname(outModel), { recursive: true });
+async function fetchOne(url, out, label) {
+  if (existsSync(out)) return;
+  mkdirSync(dirname(out), { recursive: true });
   try {
-    const res = await fetch(MODEL_URL);
+    const res = await fetch(url);
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
     await new Promise((resolve, reject) => {
-      const out = createWriteStream(outModel);
-      Readable.fromWeb(res.body).pipe(out).on("finish", resolve).on("error", reject);
+      const ws = createWriteStream(out);
+      Readable.fromWeb(res.body).pipe(ws).on("finish", resolve).on("error", reject);
     });
-    console.log("[assets] model downloaded");
+    console.log(`[assets] ${label} downloaded`);
   } catch (err) {
-    console.warn(`[assets] model download failed (${err.message}); runtime will use the CDN fallback`);
+    // Hard failure: the app no longer has a CDN fallback (that path was a remote
+    // code-execution surface), so a missing asset means a broken build.
+    console.error(`[assets] FAILED to fetch ${label}: ${err.message}`);
+    process.exitCode = 1;
   }
 }
 
 copyWasm();
-await fetchModel();
+await fetchOne(MODEL_URL, outModel, "face model");
+await fetchOne(POSE_URL, outPose, "pose model");

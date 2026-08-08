@@ -5,9 +5,10 @@ import {
 } from "@mediapipe/tasks-vision";
 import type { IGazeEngine } from "@/core/engine/IGazeEngine";
 
-const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
-const POSE_MODEL =
-  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+// Bundle-local, like the gaze engine's assets — nothing is fetched at runtime.
+// See MediaPipeGazeEngine.init() for why the CDN paths were removed.
+const WASM = "/mediapipe/wasm";
+const POSE_MODEL = "/mediapipe/pose_landmarker.task";
 
 const FACE = "rgba(125,200,255,0.85)";
 const MESH = "rgba(125,200,255,0.22)";
