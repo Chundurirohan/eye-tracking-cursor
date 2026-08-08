@@ -71,6 +71,8 @@ const SMALL_TARGET = 0.11;     // only auto-learn drift from targets smaller tha
 const CONF_RADIUS_GAIN = 0.4;  // low confidence widens the snap radius by up to this
 const INTENT_BONUS = 0.4;      // a target dead-on your gaze trajectory reads up to
                                // 40% "closer", so intent — not just proximity — wins
+const AREA_BIAS = 2.0;         // tiebreak toward the SMALLER of overlapping targets
+                               // (a nested close-tab × should beat its big parent tab)
 const COMMIT_LOCK = 0.35;      // dwell progress past which the well pulls fully to
                                // center (rock-steady while you commit the click)
 const CLICKABLE = 'button, a, [role="button"], input, [data-dwell]';
@@ -141,6 +143,11 @@ function nearestNativeTarget(px: number, py: number, limit: number, vx: number, 
       const align = Math.max(0, (dirx * vx + diry * vy) / (dmag * vmag));
       score = d * (1 - INTENT_BONUS * align);
     }
+    // Prefer the SMALLER target when several overlap (edge-distance ties at ~0
+    // whenever gaze is inside a target, so a tiny close-tab × nested in its big
+    // tab would otherwise lose to the tab). The area term is tiny (w*h) so it only
+    // breaks near-ties — it never overrides a genuinely closer larger control.
+    score += AREA_BIAS * (t.w * t.h);
     if (score < bestScore) { bestScore = score; best = t; }
   }
   return best;

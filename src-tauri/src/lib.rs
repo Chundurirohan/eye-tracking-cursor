@@ -677,40 +677,49 @@ mod mac_ax {
         };
         enable_app_a11y(app); // make Chromium/Electron web content hit-testable
 
-        // Grid step, chosen against the scanner's 120ms budget. 36pt gave 11×11 =
-        // 121 probes and measured 105–228ms — already over. 48pt gives 9×9 = 81
-        // (a third fewer), which funds the ambiguous-role action check in
-        // `actionable_rect` without regressing the budget. Still well under the
-        // ~60pt minimum size of real toolbar buttons and tabs, so nothing that was
-        // detectable before stops being detectable.
-        let step = 48.0_f64;
-        let n = ((radius / step) as i32).clamp(1, 6);
-        for iy in -n..=n {
-            for ix in -n..=n {
-                let px = gx + ix as f64 * step;
-                let py = gy + iy as f64 * step;
-                let mut el: AXUIElementRef = std::ptr::null();
-                probes += 1;
-                let err = AXUIElementCopyElementAtPosition(app, px as f32, py as f32, &mut el);
-                if err != 0 || el.is_null() { continue; }
-                hits += 1;
-                if census {
-                    if let Some(r) = ax_role(el) { *roles.entry(r).or_insert(0) += 1; }
-                }
-                if let Some((cx, cy, w, h, strength)) = actionable_rect(el) {
-                    // Dedup by center proximity (the grid hits the same button many
-                    // times) and drop container-sized hits. Filter mainly on HEIGHT:
-                    // real clickables (buttons, search bars, menu items) are short but
-                    // can be WIDE — a wide Google search bar was being wrongly excluded
-                    // by a symmetric 600px cap.
-                    if h < 220.0 && w < 1600.0
-                        && !out.iter().any(|&(ex, ey, _, _, _)| (ex - cx).abs() < 6.0 && (ey - cy).abs() < 6.0)
-                    {
-                        out.push((cx, cy, w, h, strength));
+        // Two-tier probe grid — the outer tier from this branch, the fine inner
+        // tier merged in from tracker/main.
+        //
+        // A COARSE outer grid covers the whole magnet radius for normal buttons and
+        // search bars. A FINE inner grid sweeps the small region right around the
+        // gaze so TINY controls — the close-tab ×, small toolbar icons — are landed
+        // on at all: a 44pt step steps clean over a 16pt button, which is exactly
+        // why the × was never detected.
+        //
+        // Probe count IS the scan cost (each probe is a cross-process AX call), and
+        // 81 probes already measured 105–228ms against a 120ms budget. So both
+        // tiers are sized for that budget rather than for coverage alone: ~49 inner
+        // + ~81 outer. `[gaze][scan] SLOW` reports overruns so this stays tunable
+        // from measurements instead of guesswork.
+        let passes: [(f64, f64); 2] = [(40.0, 13.0), (radius, 44.0)];
+        for (reach, step) in passes {
+            let n = ((reach / step) as i32).clamp(1, 8);
+            for iy in -n..=n {
+                for ix in -n..=n {
+                    let px = gx + ix as f64 * step;
+                    let py = gy + iy as f64 * step;
+                    let mut el: AXUIElementRef = std::ptr::null();
+                    probes += 1;
+                    let err = AXUIElementCopyElementAtPosition(app, px as f32, py as f32, &mut el);
+                    if err != 0 || el.is_null() { continue; }
+                    hits += 1;
+                    if census {
+                        if let Some(r) = ax_role(el) { *roles.entry(r).or_insert(0) += 1; }
                     }
+                    if let Some((cx, cy, w, h, strength)) = actionable_rect(el) {
+                        // Dedup by center proximity (the grid hits the same button
+                        // many times) and drop container-sized hits. Filter mainly on
+                        // HEIGHT: real clickables are short but can be WIDE — a wide
+                        // search bar was wrongly excluded by a symmetric cap.
+                        if h < 220.0 && w < 1600.0
+                            && !out.iter().any(|&(ex, ey, _, _, _)| (ex - cx).abs() < 6.0 && (ey - cy).abs() < 6.0)
+                        {
+                            out.push((cx, cy, w, h, strength));
+                        }
+                    }
+                    CFRelease(el as CFTypeRef);
+                    if out.len() >= 80 { CFRelease(app as CFTypeRef); return out; }
                 }
-                CFRelease(el as CFTypeRef);
-                if out.len() >= 48 { CFRelease(app as CFTypeRef); return out; }
             }
         }
         CFRelease(app as CFTypeRef);

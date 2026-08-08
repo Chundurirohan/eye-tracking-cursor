@@ -31,16 +31,21 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "macOS": {
-      "entitlements": "Entitlements.plist"
-    },
+    "targets": ["app", "dmg"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "copyright": "Copyright © 2026 Rohan Chunduri",
+    "category": "public.app-category.utilities",
+    "shortDescription": "Hands-free gaze cursor control",
+    "longDescription": "Gaze estimates where you are looking with your webcam and moves the macOS cursor there, clicking by dwell — hands-free system-wide control.",
+    "macOS": {
+      "entitlements": "Entitlements.plist",
+      "minimumSystemVersion": "11.0"
+    }
   }
 }

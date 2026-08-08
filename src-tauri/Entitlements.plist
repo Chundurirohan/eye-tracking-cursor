@@ -2,12 +2,33 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Required once the app is signed with Hardened Runtime (which Tauri enables
-         whenever APPLE_SIGNING_IDENTITY is set). Without this the camera is denied
-         at the runtime level BEFORE TCC is consulted: no permission prompt appears,
-         nothing is logged by tccd, and the app just reports "no camera" no matter
-         what System Settings says. Unsigned/ad-hoc builds have no Hardened Runtime
-         and so never needed it — which is why this only broke after signing. -->
+    <!--
+      Hardened Runtime entitlements for a DEVELOPER ID (non-App-Store) build.
+      NOTE: deliberately NO com.apple.security.app-sandbox — Gaze drives the
+      system cursor, injects clicks into other apps, and reads their
+      Accessibility trees, none of which are possible inside the sandbox.
+      Distribute this build directly (notarized DMG), not via the Mac App Store.
+    -->
+
+    <!-- WKWebView (the Tauri frontend) needs JIT + executable JS memory. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <!-- Allow loading the webview / system frameworks under hardened runtime. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Local, on-device gaze estimation from the webcam (paired with the
+         NSCameraUsageDescription prompt string in Info.plist).
+
+         Required once the app is signed with Hardened Runtime (which Tauri
+         enables whenever APPLE_SIGNING_IDENTITY is set). Without this the camera
+         is denied at the runtime level BEFORE TCC is consulted: no permission
+         prompt appears, nothing is logged by tccd, and the app just reports "no
+         camera" no matter what System Settings says. Unsigned/ad-hoc builds have
+         no Hardened Runtime and so never needed it — which is why this only
+         broke after signing. -->
     <key>com.apple.security.device.camera</key>
     <true/>
 </dict>
