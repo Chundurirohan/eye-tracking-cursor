@@ -86,11 +86,12 @@ export function featureBasis(f: GazeFeature): number[] {
  * was fit against a different (older) feature basis. */
 export const FEATURE_BASIS_DIM = featureBasis({ ix: 0, iy: 0, yaw: 0, pitch: 0 }).length;
 
-function ridge(X: number[][], y: number[], lambda: number): number[] {
+function ridge(X: number[][], y: number[], lambda: number, rows?: number[]): number[] {
   const n = X[0]!.length;
   const A = Array.from({ length: n }, () => new Array<number>(n).fill(0));
   const b = new Array<number>(n).fill(0);
-  for (let r = 0; r < X.length; r++) {
+  const idx = rows ?? X.map((_, i) => i);
+  for (const r of idx) {
     for (let i = 0; i < n; i++) {
       b[i]! += X[r]![i]! * y[r]!;
       for (let j = 0; j < n; j++) A[i]![j]! += X[r]![i]! * X[r]![j]!;
@@ -116,14 +117,60 @@ function ridge(X: number[][], y: number[], lambda: number): number[] {
 
 const dot = (w: number[], x: number[]) => w.reduce((s, wi, i) => s + wi * (x[i] ?? 0), 0);
 
-export function fitCalibration(points: CalibrationPoint[], lambda = 1e-2): CalibrationModel {
+// Regularisation strengths considered by the cross-validated search below.
+// Spans four orders of magnitude: a clean signal wants the weak end, a noisy one
+// the strong end, and the correct choice is not knowable in advance.
+const LAMBDA_GRID = [1e-3, 1e-2, 1e-1, 1, 10, 100];
+const CV_FOLDS = 5;
+
+/**
+ * Choose the ridge penalty by k-fold cross-validation over held-out GRID POINTS,
+ * scoring each candidate on how well it predicts screen positions it never saw.
+ *
+ * Folds are by point, not by sample: samples within one dwell are near-identical,
+ * so a sample-wise split lets the model memorise each position and every lambda
+ * scores identically. Predicting an unseen point is the property we actually
+ * need, since between calibration dots is exactly where the user will look.
+ */
+function selectLambda(
+  Xs: number[][], yx: number[], yy: number[], rowPoint: number[], nPoints: number,
+): number {
+  if (nPoints < CV_FOLDS * 2) return 1e-2; // too few points to split meaningfully
+  const foldOf = (pi: number) => pi % CV_FOLDS;
+  let best = 1e-2, bestErr = Infinity;
+  for (const lam of LAMBDA_GRID) {
+    let err = 0, count = 0;
+    for (let f = 0; f < CV_FOLDS; f++) {
+      const train: number[] = [], test: number[] = [];
+      for (let r = 0; r < Xs.length; r++) {
+        (foldOf(rowPoint[r]!) === f ? test : train).push(r);
+      }
+      if (!train.length || !test.length) continue;
+      const wxF = ridge(Xs, yx, lam, train);
+      const wyF = ridge(Xs, yy, lam, train);
+      for (const r of test) {
+        err += Math.hypot(dot(wxF, Xs[r]!) - yx[r]!, dot(wyF, Xs[r]!) - yy[r]!);
+        count++;
+      }
+    }
+    if (count && err / count < bestErr) { bestErr = err / count; best = lam; }
+  }
+  return best;
+}
+
+export function fitCalibration(points: CalibrationPoint[], lambda?: number): CalibrationModel {
   const X: number[][] = [], yx: number[] = [], yy: number[] = [];
-  for (const p of points) {
+  // Which grid point each row came from — folds must split by POINT, never by
+  // sample. Samples from one dwell are near-duplicates, so splitting by sample
+  // leaks the answer across folds and every lambda scores the same.
+  const rowPoint: number[] = [];
+  points.forEach((p, pi) => {
     for (const s of p.samples) {
       X.push(featureBasis(s.feature));
       yx.push(p.x); yy.push(p.y);
+      rowPoint.push(pi);
     }
-  }
+  });
   if (X.length < 8) throw new Error("Insufficient calibration samples");
 
   // Standardize each basis column (except the intercept) before ridge, so the
@@ -148,8 +195,21 @@ export function fitCalibration(points: CalibrationPoint[], lambda = 1e-2): Calib
     w[0] = b;
     return w;
   };
-  const wx = toRaw(ridge(Xs, yx, lambda));
-  const wy = toRaw(ridge(Xs, yy, lambda));
+  // Pick the regularisation strength FROM THE DATA rather than fixing it.
+  //
+  // A fixed lambda = 1e-2 fits 17 basis terms from 25 distinct screen positions.
+  // On a clean signal that's fine; on a weak one (a small laptop panel needs far
+  // less eye rotation, so the same noise is a much larger share of the signal) it
+  // fits the noise, and prediction variance explodes. Telemetry from the moving
+  // phase showed exactly that: the cursor swinging across the full screen with
+  // pursuit correlation flapping between 0% and 83% — high variance, not a frozen
+  // cursor, which on screen reads as violent shaking.
+  //
+  // Held-out error across grid points picks a weak penalty when the signal
+  // supports it and a strong one when it doesn't, automatically.
+  const chosen = lambda ?? selectLambda(Xs, yx, yy, rowPoint, points.length);
+  const wx = toRaw(ridge(Xs, yx, chosen));
+  const wy = toRaw(ridge(Xs, yy, chosen));
 
   let err = 0;
   for (let i = 0; i < X.length; i++) {
@@ -167,10 +227,22 @@ export function fitCalibration(points: CalibrationPoint[], lambda = 1e-2): Calib
     anchors.push({ px, py, dx: p.x - px, dy: p.y - py });
   }
 
-  return { wx, wy, residual: err / X.length, anchors };
+  return { wx, wy, residual: err / X.length, anchors, lambda: chosen };
 }
 
 const CORRECT_SIGMA = 0.15; // screen-fraction radius of local-correction influence
+// Background weight added to the denominator so the correction FADES OUT with
+// distance. Normalising by `wsum` alone makes the correction scale-free: far from
+// every anchor all weights are tiny, but their ratio is unchanged, so the nearest
+// anchor's residual still applies at full strength. A distant, badly-fit grid
+// point could therefore yank the cursor across the screen, and gaze noise flipping
+// which anchor dominates would teleport it between two spots — a bistable judder,
+// worst exactly where the global fit is weakest.
+const CORRECT_W0 = 0.35;
+// Hard ceiling on the correction. It exists to refine a prediction, not to
+// relocate it; without a cap one bad anchor can move the cursor further than the
+// model it is correcting.
+const MAX_CORRECTION = 0.18;
 
 export function applyCalibration(m: CalibrationModel, f: GazeFeature) {
   const b = featureBasis(f);
@@ -188,7 +260,13 @@ export function applyCalibration(m: CalibrationModel, f: GazeFeature) {
       const w = Math.exp(-((x - a.px) ** 2 + (y - a.py) ** 2) / s2);
       wsum += w; dx += w * a.dx; dy += w * a.dy;
     }
-    if (wsum > 1e-6) { x += dx / wsum; y += dy / wsum; }
+    if (wsum > 1e-6) {
+      let cx = dx / (wsum + CORRECT_W0);
+      let cy = dy / (wsum + CORRECT_W0);
+      const mag = Math.hypot(cx, cy);
+      if (mag > MAX_CORRECTION) { cx *= MAX_CORRECTION / mag; cy *= MAX_CORRECTION / mag; }
+      x += cx; y += cy;
+    }
   }
   return { x: clamp01(x), y: clamp01(y) };
 }

@@ -37,7 +37,12 @@ export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrat
   const s = 1.8;
 
   return (
-    <div style={{ position: "absolute", bottom: "var(--s-5)", zIndex: 10, ...pos }}>
+    // `--dock-lift` restores the pre-full-screen-window position (the window now
+    // extends behind the Dock); `--ui-scale` sizes the whole capsule to the
+    // display. Scaling the container keeps every inner metric in proportion
+    // without touching them individually. Both are set in App.tsx.
+    <div style={{ position: "absolute", bottom: "calc(var(--s-5) + var(--dock-lift, 0px))", zIndex: 10,
+      transform: "scale(var(--ui-scale, 1))", transformOrigin: "bottom center", ...pos }}>
       {open && <SettingsPopover side={side} onClose={() => setOpen(false)}>{settingsSlot}</SettingsPopover>}
       <Glass radius="pill" style={{ display: "flex", alignItems: "center", gap: 11 * s, padding: `${8 * s}px ${10 * s}px ${8 * s}px ${14 * s}px`,
         transition: "padding var(--dur-med) var(--ease-soft)" }}>

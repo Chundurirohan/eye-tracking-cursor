@@ -80,13 +80,34 @@ export async function snapTarget(
 
 /** All nearby clickable targets (from the background scanner cache), each as
  * [nx, ny, wNorm, hNorm] normalized to window content. Fetched a few times a
- * second; the caller hit-tests it locally every frame for instant magnetism. */
-export async function nativeTargets(): Promise<[number, number, number, number][]> {
+ * second; the caller hit-tests it locally every frame for instant magnetism.
+ *
+ * `nx`/`ny` must be the RAW gaze point, NOT the snapped reticle — it re-aims the
+ * background scanner. Passing the snapped point makes the magnet feed on its own
+ * output and the reticle judders between unrelated targets. */
+export async function nativeTargets(
+  nx: number, ny: number,
+): Promise<[number, number, number, number, number][]> {
   if (!inTauri) return [];
   try {
-    return (await invoke("nearby_targets")) as [number, number, number, number][];
+    return (await invoke("nearby_targets", { nx, ny })) as
+      [number, number, number, number, number][];
   } catch {
     return [];
+  }
+}
+
+/** Display the app is on: `[widthPt, heightPt, scale, monitorCount, isExternal]`.
+ * Used to size gaze UI to the actual device — a 13" laptop panel and a 27"
+ * external differ enormously in both point size and viewing distance. */
+export async function screenInfo(): Promise<
+  [number, number, number, number, boolean] | null
+> {
+  if (!inTauri) return null;
+  try {
+    return (await invoke("screen_info")) as [number, number, number, number, boolean];
+  } catch {
+    return null;
   }
 }
 
@@ -114,6 +135,12 @@ export function zoomOut(): void {
 export function typeText(text: string): void {
   if (!inTauri) return;
   void invoke("type_text", { text }).catch(() => {});
+}
+
+/** Print a diagnostic line to the app's stdout (release builds have no console). */
+export function devLog(line: string): void {
+  if (!inTauri) return;
+  void invoke("dev_log", { line }).catch(() => {});
 }
 
 /** Tap a virtual key by macOS keycode (backspace 51, return 36, space 49, …). */

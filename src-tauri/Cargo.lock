@@ -1137,6 +1137,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gaze"
+version = "3.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "core-foundation 0.9.4",
+ "core-graphics 0.23.2",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-global-shortcut",
+ "tauri-plugin-opener",
+]
+
+[[package]]
 name = "gdk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3375,21 +3390,6 @@ dependencies = [
  "webview2-com",
  "window-vibrancy",
  "windows",
-]
-
-[[package]]
-name = "tauri-appeye-ap"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "core-foundation 0.9.4",
- "core-graphics 0.23.2",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-global-shortcut",
- "tauri-plugin-opener",
 ]
 
 [[package]]

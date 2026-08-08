@@ -68,7 +68,11 @@ export function OnScreenKeyboard({ onClose, onKeyFeedback }: {
   });
 
   return (
-    <div style={{ position: "fixed", left: "50%", bottom: "calc(var(--s-4) + 40px)", transform: "translateX(-50%)",
+    // Same treatment as the HUD capsule: lifted clear of the Dock and scaled to
+    // the display. The keyboard is the largest fixed-pixel surface in the app, so
+    // on a 14" panel it is the one that most needs to shrink.
+    <div style={{ position: "fixed", left: "50%", bottom: "calc(var(--s-4) + 40px + var(--dock-lift, 0px))",
+      transform: "translateX(-50%) scale(var(--ui-scale, 1))", transformOrigin: "bottom center",
       zIndex: 88, width: "min(1600px, 99vw)" }}>
       <div className="glass" style={{ borderRadius: "var(--radius-lg)", padding: "22px 24px",
         display: "flex", flexDirection: "column", gap: 16 }}>

@@ -6,6 +6,7 @@ import type { ConfidenceFactors } from "@/core/engine/types";
 import { Glass } from "@/features/shared/Glass";
 import { calibrationCoaching, type Coaching } from "./coaching";
 import { confidenceLook } from "@/features/shared/confidenceColor";
+import { devLog } from "@/core/system/nativeInput";
 
 // How long confidence must sit below the acceptable bar before we surface
 // coaching — long enough not to flicker on a brief dip.
@@ -23,6 +24,12 @@ export function CalibrationScene({
 }) {
   const [progress, setProgress] = useState<CalibrationProgress | null>(null);
   const [coaching, setCoaching] = useState<Coaching | null>(null);
+  // Moving-phase telemetry, summarised once a second to the app's stdout.
+  // "The reticle is stuck" has several distinct causes that look identical on
+  // screen — the cursor saturating at a screen edge (model over-extrapolating,
+  // `applyCalibration` clamps to 0/1), parked dead centre (basis-mismatch guard),
+  // or moving but uncorrelated with the dot. These counters tell them apart.
+  const mvRef = useRef({ t: 0, n: 0, follow: 0, minX: 1, maxX: 0, minY: 1, maxY: 0, edge: 0, centre: 0 });
   const lowSinceRef = useRef<number | null>(null);
   const completeRef = useRef(onComplete);
   completeRef.current = onComplete;
@@ -42,6 +49,31 @@ export function CalibrationScene({
         setProgress(p);
         const now = performance.now();
         if (now - lastConf > 100) { lastConf = now; confRef.current?.(p.confidence); }
+
+        // --- moving-phase telemetry (see mvRef) ---
+        if (p.movingPos) {
+          const m = mvRef.current;
+          if (!m.t) m.t = now;
+          m.n++;
+          if (p.inRange) m.follow++;
+          const c = p.cursorPos;
+          if (c) {
+            m.minX = Math.min(m.minX, c.x); m.maxX = Math.max(m.maxX, c.x);
+            m.minY = Math.min(m.minY, c.y); m.maxY = Math.max(m.maxY, c.y);
+            // Saturated against the clamp, or parked at the basis-mismatch centre.
+            if (c.x <= 0.001 || c.x >= 0.999 || c.y <= 0.001 || c.y >= 0.999) m.edge++;
+            if (Math.abs(c.x - 0.5) < 1e-6 && Math.abs(c.y - 0.5) < 1e-6) m.centre++;
+          }
+          if (now - m.t > 1000) {
+            devLog(
+              `moving: ${m.n}f follow=${((m.follow / m.n) * 100) | 0}% ` +
+              `cursorX=[${m.minX.toFixed(2)},${m.maxX.toFixed(2)}] ` +
+              `cursorY=[${m.minY.toFixed(2)},${m.maxY.toFixed(2)}] ` +
+              `edgeClamped=${((m.edge / m.n) * 100) | 0}% deadCentre=${((m.centre / m.n) * 100) | 0}%`,
+            );
+            mvRef.current = { t: now, n: 0, follow: 0, minX: 1, maxX: 0, minY: 1, maxY: 0, edge: 0, centre: 0 };
+          }
+        }
       },
       (m, q, w) => completeRef.current(m, q, w));
     ctrl.start(weakPointIds.length ? weakPointIds : undefined);

@@ -13,7 +13,7 @@ import { LandmarkOverlay } from "@/features/diagnostics/LandmarkOverlay";
 import { ConfidenceMeter } from "@/features/shared/ConfidenceMeter";
 import { Toggle } from "@/features/shared/Toggle";
 import { useHotkeys } from "@/features/shared/useHotkeys";
-import { setClickThrough, nativeClick, dispatchAction, isTrusted, zoomToggle } from "@/core/system/nativeInput";
+import { setClickThrough, nativeClick, dispatchAction, isTrusted, zoomToggle, screenInfo } from "@/core/system/nativeInput";
 import { RadialMenu } from "@/features/tracking/RadialMenu";
 import { OnScreenKeyboard } from "@/features/tracking/OnScreenKeyboard";
 import { PoseAdaptiveCorrector } from "@/core/engine/adaptation";
@@ -25,6 +25,24 @@ import "@/styles/global.css";
 // How many calibration passes (initial + weak-point refinements) before we
 // accept a best-effort result instead of looping forever.
 const MAX_CALIBRATION_ATTEMPTS = 3;
+
+// --- Display-proportional UI -----------------------------------------------
+// A 27" desktop display is the reference: at that size everything renders at
+// 1.0 and nothing changes. Smaller panels scale DOWN proportionally, because the
+// HUD and keyboard are sized in absolute pixels and a control bar tuned for 27"
+// eats an absurd share of a 14" laptop screen.
+//
+// Height in logical points is the right yardstick, not inches or physical pixels:
+// macOS already folds display scaling into it, so a 27" desktop reads ~1440pt and
+// a 14" MacBook ~982pt (≈0.68×) — which is the ratio we actually want.
+const REFERENCE_HEIGHT_PT = 1440; // 27" desktop display
+const MIN_UI_SCALE = 0.62;
+
+// The window now spans the WHOLE display (so gaze can reach the menu bar and
+// Dock), which means its bottom edge is behind the Dock rather than above it —
+// bottom-anchored UI slid down with it. This lifts that UI back to where it sat
+// when the window stopped short of the Dock.
+const DOCK_LIFT_PT = 74;
 
 function Inner() {
   const { state, context, send, saved, patchSaved, ready } = useSession();
@@ -38,6 +56,26 @@ function Inner() {
   // Gaze control of the OS cursor. Armed by default post-calibration (cursor is
   // joined to the gaze); ⌃⌥Space disarms → all control to mouse/trackpad, no fight.
   const [armed, setArmed] = useState(true);
+
+  // Publish display-derived sizing as CSS vars, so every bottom-anchored surface
+  // (HUD capsule, on-screen keyboard) scales from one place. See the constants
+  // above for why height in points is the yardstick.
+  useEffect(() => {
+    let alive = true;
+    const apply = async () => {
+      const info = await screenInfo();
+      if (!alive) return;
+      const heightPt = info ? info[1] : window.innerHeight;
+      const scale = Math.min(1, Math.max(MIN_UI_SCALE, heightPt / REFERENCE_HEIGHT_PT));
+      const root = document.documentElement;
+      root.style.setProperty("--ui-scale", String(scale));
+      // Lift scales too, so it stays proportionate on a small panel.
+      root.style.setProperty("--dock-lift", `${Math.round(DOCK_LIFT_PT * scale)}px`);
+    };
+    void apply();
+    window.addEventListener("resize", apply); // display change / monitor swap
+    return () => { alive = false; window.removeEventListener("resize", apply); };
+  }, []);
   // Radial action menu: the normalized gaze point where it's anchored, or null.
   const [actionMenu, setActionMenu] = useState<{ nx: number; ny: number } | null>(null);
   const [showKeyboard, setShowKeyboard] = useState(false);
@@ -331,7 +369,16 @@ function Inner() {
       {actionMenu && (
         <RadialMenu
           center={{ x: actionMenu.nx * window.innerWidth, y: actionMenu.ny * window.innerHeight }}
-          onSelect={(action) => { dispatchAction(action, actionMenu.nx, actionMenu.ny); setActionMenu(null); }}
+          onSelect={(action) => {
+            dispatchAction(action, actionMenu.nx, actionMenu.ny);
+            // A real action landed — this, and only this, counts as a COMPLETED
+            // click and lifts magnet-fatigue suppression (see DwellCursor).
+            // Opening the wheel is not enough, and Cancel below deliberately does
+            // NOT fire: backing out is exactly the "I didn't want that" signal
+            // suppression exists to record.
+            window.dispatchEvent(new CustomEvent("gaze:action-committed"));
+            setActionMenu(null);
+          }}
           onCancel={() => setActionMenu(null)} />
       )}
       {isWidget && showKeyboard && (

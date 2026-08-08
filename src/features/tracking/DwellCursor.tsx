@@ -26,12 +26,26 @@ const SNAP_FRAC = 0.048;    // slightly weaker magnet: only captures when you're
                            // targets (so an UNdetected control beside a detected
                            // one isn't impossible to reach)
 const FREE_TOL = 0.06;      // free-space dwell jitter tolerance
+// Undetected space has no element to lock onto, so the dwell is anchored to a
+// point and RESTARTS whenever the gaze strays past the tolerance above. On a
+// noisy signal that reset fires constantly and the timer can never finish — the
+// "dwell does nothing on tabs / the search bar" bug. Widen the tolerance as
+// confidence drops (same idea as CONF_RADIUS_GAIN) so the hold stays completable
+// exactly when the signal is worst. The longer FREE_DWELL_MS is what keeps it
+// deliberate; the tolerance only decides whether it can complete at all.
+const CONF_TOL_GAIN = 1.4;
 const FREE_LEAVE = 0.1;     // leave-to-rearm distance
 const ANCHOR_EMA = 0.1;
 // Edge-gaze scrolling / hands-free reading: resting gaze in a band near the top
-// or bottom edge (clear of the menu bar and Dock) scrolls the page.
-const SCROLL_TOP: [number, number] = [0.03, 0.11];    // [min, max] normalized y for "scroll up"
-const SCROLL_BOTTOM: [number, number] = [0.89, 0.97]; // [min, max] normalized y for "scroll down"
+// or bottom edge scrolls the page.
+//
+// These are inset from the true screen edges. The window now spans the WHOLE
+// display (so gaze can reach the menu bar and Dock — see `display_rect` in
+// lib.rs), which means y≈0 is the menu bar and y≈1 is the Dock. Bands sitting on
+// top of them would fight the very targets we just made reachable, so they start
+// below the menu bar and end above the Dock.
+const SCROLL_TOP: [number, number] = [0.05, 0.13];    // [min, max] normalized y for "scroll up"
+const SCROLL_BOTTOM: [number, number] = [0.80, 0.88]; // [min, max] normalized y for "scroll down"
 const SCROLL_DELAY = 400;   // dwell in the band before scrolling starts
 const SCROLL_TICK_MS = 40;  // scroll cadence
 const SCROLL_STEP = 34;     // pixels per tick
@@ -43,6 +57,15 @@ const STICKY_MARGIN = 1.35;    // once dwelling, keep the target until gaze leav
 const REJECT_MIN_PROG = 0.12;  // the dwell must have started for a leave to count
 const REJECT_WINDOW = 4500;    // ms — rejections must cluster in time to count
 const REJECT_COUNT = 2;        // this many rejections → suppress the target
+// Suppression normally lifts on a COMPLETED action (`gaze:action-committed`):
+// the wheel opened AND a real petal was chosen. Cancel does not count.
+//
+// This long timeout is only a backstop against a permanent wedge, not the
+// intended exit. It can afford to be long because suppression cannot actually
+// deadlock the magnet: a suppressed target still sits in free space, and the
+// free-space dwell (which needs no magnet) opens the wheel, so committing an
+// action — and clearing suppression — is always reachable.
+const SUPPRESS_MS = 60000;
 const SMALL_TARGET = 0.11;     // only auto-learn drift from targets smaller than this
                                // (normalized), where the gaze was genuinely on it
 const CONF_RADIUS_GAIN = 0.4;  // low confidence widens the snap radius by up to this
@@ -51,6 +74,11 @@ const INTENT_BONUS = 0.4;      // a target dead-on your gaze trajectory reads up
 const COMMIT_LOCK = 0.35;      // dwell progress past which the well pulls fully to
                                // center (rock-steady while you commit the click)
 const CLICKABLE = 'button, a, [role="button"], input, [data-dwell]';
+// The HUD's own controls sit in a fixed cluster you look past constantly on the
+// way to the rest of the screen. At full strength that cluster keeps catching the
+// cursor in transit, so its catch radius is scaled down — still magnetic once
+// you're on a control, far less grabby when you're merely crossing it.
+const HUD_SNAP_STRENGTH = 0.6;
 
 type P = { x: number; y: number };
 
@@ -89,7 +117,7 @@ function nearestClickable(px: number, py: number, limit: number, vx: number, vy:
   return best;
 }
 
-type NativeTarget = { x: number; y: number; w: number; h: number };
+type NativeTarget = { x: number; y: number; w: number; h: number; strength: number };
 
 /** Nearest system-wide clickable (from the scanner cache) within `limit`
  * NORMALIZED units of (px,py), intent-biased toward gaze motion. All coords are
@@ -99,10 +127,13 @@ function nearestNativeTarget(px: number, py: number, limit: number, vx: number, 
   let best: NativeTarget | null = null, bestScore = limit;
   for (const t of list) {
     if (suppressed.size && suppressed.has(keyOf(t.x, t.y))) continue; // magnet-fatigue
+    // Per-target strength (Rust sends it) scales the catch radius, so weaker
+    // targets like the Dock only grab you when you are clearly on them.
+    const reach = limit * (t.strength ?? 1);
     const dx = Math.max(Math.abs(px - t.x) - t.w / 2, 0);
     const dy = Math.max(Math.abs(py - t.y) - t.h / 2, 0);
     const d = Math.hypot(dx, dy);
-    if (d >= limit) continue;
+    if (d >= reach) continue;
     let score = d;
     if (vmag > 0.15) {
       const dirx = t.x - px, diry = t.y - py;
@@ -187,12 +218,29 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
   // the snap target from the previous frame (to detect an abandoned dwell).
   const rejectRef = useRef<Map<string, { count: number; t: number }>>(new Map());
   const suppressRef = useRef<Set<string>>(new Set());
+  const suppressUntilRef = useRef<Map<string, number>>(new Map()); // key → expiry (see SUPPRESS_MS)
   const lastSnapRef = useRef<string | null>(null); // snap-target key from the last frame
 
   useEffect(() => {
     const onGaze = (e: Event) => { posRef.current = (e as CustomEvent<P>).detail; lastGazeRef.current = performance.now(); };
     window.addEventListener("gaze:point", onGaze as EventListener);
     return () => window.removeEventListener("gaze:point", onGaze as EventListener);
+  }, []);
+
+  // Magnet-fatigue lifts only on a COMPLETED action: the wheel opened AND a real
+  // petal (Click / Double / Right) was chosen. Opening the wheel doesn't count,
+  // and Cancel deliberately doesn't either — backing out is the very "I didn't
+  // want that target" signal the suppression is recording, so clearing on it
+  // would undo the rejection the user just expressed.
+  useEffect(() => {
+    const onCommitted = () => {
+      suppressRef.current.clear();
+      suppressUntilRef.current.clear();
+      rejectRef.current.clear();
+      lastSnapRef.current = null;
+    };
+    window.addEventListener("gaze:action-committed", onCommitted);
+    return () => window.removeEventListener("gaze:action-committed", onCommitted);
   }, []);
 
   // Poll the scanner cache into a local list (the scan itself runs on a Rust
@@ -203,7 +251,11 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
     let alive = true;
     const pull = async () => {
       if (!alive) return;
-      nativeListRef.current = (await nativeTargets()).map(([x, y, w, h]) => ({ x, y, w, h }));
+      // Raw gaze (posRef), never the snapped reticle — this re-aims the native
+      // scanner, so feeding it the snapped point closes a feedback loop.
+      const p = posRef.current;
+      if (!p) return;
+      nativeListRef.current = (await nativeTargets(p.x, p.y)).map(([x, y, w, h, strength]) => ({ x, y, w, h, strength }));
     };
     void pull();
     const id = window.setInterval(pull, 110);
@@ -217,9 +269,10 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
       lastClickRef.current = now; dwellStartRef.current = now; setProgress(0);
       setFlash(true); setRipple({ x: sx, y: sy, id: now });
       window.setTimeout(() => setFlash(false), 200);
-      // The click is done → lift magnet-fatigue suppression (per the spec: suppress
-      // only until the following click lands) and reset rejection tracking.
-      suppressRef.current.clear(); rejectRef.current.clear(); lastSnapRef.current = null;
+      // NOTE: suppression is deliberately NOT lifted here. `fire` also runs when a
+      // dwell merely OPENS the action wheel, which commits to nothing — clearing
+      // here let a target you were still rejecting immediately grab you again.
+      // Only a completed action clears it, via `gaze:action-committed` below.
     };
     const tick = () => {
       raf = requestAnimationFrame(tick);
@@ -230,6 +283,14 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
         dispSmoothRef.current = null; return;
       }
       const px = p.x * window.innerWidth, py = p.y * window.innerHeight;
+
+      // Expire magnet-fatigue suppression on a timer so it can never deadlock the
+      // magnet (see SUPPRESS_MS). A landed click still clears it early, in `fire`.
+      if (suppressRef.current.size) {
+        for (const [k, until] of suppressUntilRef.current) {
+          if (now >= until) { suppressRef.current.delete(k); suppressUntilRef.current.delete(k); }
+        }
+      }
 
       // Gaze velocity (normalized units/sec) — computed up front so it feeds BOTH
       // intent-biased target selection and the settle/release decision. While the
@@ -250,7 +311,7 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
       const conf = clamp01(confRef.current ?? 0);
       const radiusN = SNAP_FRAC * (1 + CONF_RADIUS_GAIN * (1 - conf)); // normalized snap radius
       const radiusPx = radiusN * Math.min(window.innerWidth, window.innerHeight);
-      let target = nearestClickable(px, py, radiusPx, vx, vy, suppressRef.current);
+      let target = nearestClickable(px, py, radiusPx * HUD_SNAP_STRENGTH, vx, vy, suppressRef.current);
 
       // Sticky commit: once a dwell has begun, keep the SAME target even if gaze
       // jitter makes a neighbor momentarily nearest — only release when the gaze
@@ -304,7 +365,10 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
         const rj = rejectRef.current.get(k);
         if (rj && now - rj.t < REJECT_WINDOW) {
           rj.count++; rj.t = now;
-          if (rj.count >= REJECT_COUNT) suppressRef.current.add(k);
+          if (rj.count >= REJECT_COUNT) {
+            suppressRef.current.add(k);
+            suppressUntilRef.current.set(k, now + SUPPRESS_MS);
+          }
         } else {
           rejectRef.current.set(k, { count: 1, t: now });
         }
@@ -351,7 +415,13 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
       // starts prevents accidental scroll from a glance.
       const inTop = p.y > SCROLL_TOP[0] && p.y < SCROLL_TOP[1];
       const inBottom = p.y > SCROLL_BOTTOM[0] && p.y < SCROLL_BOTTOM[1];
-      if (armed && !target && !nativeSnap && (inTop || inBottom)) {
+      // Dwell takes priority over edge-scroll. The top band covers browser tabs
+      // and the address bar, so scrolling there used to `return` before the dwell
+      // ran and those controls could never be activated at all. Now scroll only
+      // engages once a dwell has already FIRED at this spot (`armedPosRef` set and
+      // not yet cleared by moving away) — so a fresh look always gets the timer,
+      // and only a continued hold after acting starts scrolling.
+      if (armed && !target && !nativeSnap && (inTop || inBottom) && armedPosRef.current) {
         if (!scrollDwellRef.current) scrollDwellRef.current = now;
         setRect(null); setProgress(0); progressRef.current = 0; targetRef.current = null; freeAnchorRef.current = null;
         if (now - scrollDwellRef.current > SCROLL_DELAY && now - lastScrollRef.current > SCROLL_TICK_MS) {
@@ -398,8 +468,12 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
           setRect(null);
         }
         const aim = nativeSnap ?? p; // where the click actually lands
+        // A detected target keeps the tight tolerance (it has real bounds to hold
+        // you); undetected space gets the confidence-widened one so the hold can
+        // actually finish on a jittery signal instead of resetting forever.
+        const tol = nativeSnap ? FREE_TOL : FREE_TOL * (1 + CONF_TOL_GAIN * (1 - conf));
         const a = freeAnchorRef.current;
-        if (!a || Math.hypot(p.x - a.x, p.y - a.y) > FREE_TOL) { freeAnchorRef.current = { ...p }; dwellStartRef.current = now; }
+        if (!a || Math.hypot(p.x - a.x, p.y - a.y) > tol) { freeAnchorRef.current = { ...p }; dwellStartRef.current = now; }
         else freeAnchorRef.current = { x: a.x + ANCHOR_EMA * (p.x - a.x), y: a.y + ANCHOR_EMA * (p.y - a.y) };
         if (armedPosRef.current) { setProgress(0); progressRef.current = 0; return; }
         // A registered clickable (native snap) opens on the normal dwell; truly
@@ -429,7 +503,16 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
 
   if (!active || !disp) return null;
   const px = disp.x * window.innerWidth, py = disp.y * window.innerHeight;
-  const R = 20, C = 2 * Math.PI * R;
+  // Reticle sized to the DISPLAY, not a fixed pixel count. A 52px ring is a
+  // reasonable target on a 13" laptop panel but visually tiny on a 27" external,
+  // and gaze accuracy scales with screen size rather than with pixels — so the
+  // ring is derived from the smaller screen dimension and clamped to stay sane on
+  // extremes (ultrawides, scaled-down panels).
+  const uiScale = Math.min(1.6, Math.max(0.85,
+    Math.min(window.innerWidth, window.innerHeight) / 900));
+  const SVG = Math.round(52 * uiScale);
+  const R = 20 * uiScale, C = 2 * Math.PI * R;
+  const HALF = SVG / 2;
   const ring = !armed ? "rgba(160,170,190,0.7)" : flash ? "#34d399" : confidenceLook(confidence ?? 0).color;
   // Confidence-aware reticle: dim + shrink slightly when tracking is uncertain,
   // so a bright, full-size reticle signals "trust me" and a faint one says "hold
@@ -455,13 +538,13 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
       )}
       <div style={{ position: "absolute", left: px, top: py, transform: "translate(-50%,-50%)",
         zIndex: 97, pointerEvents: "none", opacity: reticleOpacity, transition: "opacity 200ms" }}>
-        <svg width={52} height={52} viewBox="0 0 52 52" style={{ display: "block",
+        <svg width={SVG} height={SVG} viewBox={`0 0 ${SVG} ${SVG}`} style={{ display: "block",
           transform: `scale(${reticleScale})`, transition: "transform 120ms" }}>
-          <circle cx="26" cy="26" r={R} fill="none" stroke="rgba(255,255,255,0.22)" strokeWidth="3" />
-          <circle cx="26" cy="26" r={R} fill="none" stroke={ring} strokeWidth="3.5" strokeLinecap="round"
-            strokeDasharray={C} strokeDashoffset={C * (1 - progress)} transform="rotate(-90 26 26)"
+          <circle cx={HALF} cy={HALF} r={R} fill="none" stroke="rgba(255,255,255,0.22)" strokeWidth={3 * uiScale} />
+          <circle cx={HALF} cy={HALF} r={R} fill="none" stroke={ring} strokeWidth={3.5 * uiScale} strokeLinecap="round"
+            strokeDasharray={C} strokeDashoffset={C * (1 - progress)} transform={`rotate(-90 ${HALF} ${HALF})`}
             style={{ transition: "stroke-dashoffset 60ms linear, stroke 200ms" }} />
-          <circle cx="26" cy="26" r="4.5" fill={ring} style={{ transition: "fill 200ms" }} />
+          <circle cx={HALF} cy={HALF} r={4.5 * uiScale} fill={ring} style={{ transition: "fill 200ms" }} />
         </svg>
       </div>
     </>

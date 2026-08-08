@@ -212,14 +212,45 @@ export class CalibrationController {
   /** Cosine between the eye's recent displacement and the target's: you can't
    * smoothly pursue a target you aren't actually tracking, so this verifies
    * following without depending on the model's absolute accuracy. */
+  /**
+   * Whether the eye is tracking the moving target, by correlating cursor motion
+   * against target motion across the WHOLE pursuit window.
+   *
+   * This previously compared only the window's two endpoint samples. That works
+   * when the gaze signal is strong, but it throws away ~20 intermediate samples
+   * and lets a single noisy endpoint decide the verdict. On a laptop the screen
+   * is small and close, so tracking it takes much less eye rotation than an
+   * external monitor: the provisional cursor's displacement is small, its
+   * direction is noise-dominated, and the endpoint test then fails almost every
+   * frame. Nothing gets collected, no refit sharpens the cursor, and the reticle
+   * sits frozen — exactly the laptop-only symptom.
+   *
+   * Correlating every sample about the window mean uses all the evidence, so a
+   * small-but-consistent pursuit still reads as following while genuinely
+   * uncorrelated motion still fails. Scale-free, so it behaves the same on any
+   * display.
+   */
   private isFollowing(): boolean {
     if (this.pursuit.length < 5) return false;
     const a = this.pursuit[0]!, b = this.pursuit[this.pursuit.length - 1]!;
-    const tdx = b.tx - a.tx, tdy = b.ty - a.ty;
-    const cdx = b.cx - a.cx, cdy = b.cy - a.cy;
-    const tmag = Math.hypot(tdx, tdy), cmag = Math.hypot(cdx, cdy);
-    if (tmag < MIN_TARGET_MOTION || cmag < 1e-4) return false;
-    return (tdx * cdx + tdy * cdy) / (tmag * cmag) > FOLLOW_COS;
+    // The target must actually have travelled, or there's no direction to match.
+    if (Math.hypot(b.tx - a.tx, b.ty - a.ty) < MIN_TARGET_MOTION) return false;
+
+    const n = this.pursuit.length;
+    let mcx = 0, mcy = 0, mtx = 0, mty = 0;
+    for (const p of this.pursuit) { mcx += p.cx; mcy += p.cy; mtx += p.tx; mty += p.ty; }
+    mcx /= n; mcy /= n; mtx /= n; mty /= n;
+
+    let dot = 0, cSq = 0, tSq = 0;
+    for (const p of this.pursuit) {
+      const cdx = p.cx - mcx, cdy = p.cy - mcy;
+      const tdx = p.tx - mtx, tdy = p.ty - mty;
+      dot += cdx * tdx + cdy * tdy;
+      cSq += cdx * cdx + cdy * cdy;
+      tSq += tdx * tdx + tdy * tdy;
+    }
+    if (cSq < 1e-8 || tSq < 1e-8) return false; // cursor genuinely static
+    return dot / Math.sqrt(cSq * tSq) > FOLLOW_COS;
   }
 
   private endMoving() {

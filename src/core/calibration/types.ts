@@ -21,6 +21,10 @@ export interface CalibrationModel {
    * should have) is stored and smoothly interpolated at runtime, snapping
    * predictions toward the calibrated truth in each screen region. */
   anchors?: { px: number; py: number; dx: number; dy: number }[];
+  /** Ridge penalty the fit actually used, chosen by cross-validation. Surfaced
+   * because it is the clearest single indicator of signal quality: a weak signal
+   * (small screen, poor lighting) drives it up by orders of magnitude. */
+  lambda?: number;
 }
 
 export type { HeadPose };

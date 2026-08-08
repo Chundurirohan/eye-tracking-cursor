@@ -78,6 +78,8 @@ function runCalibration(
   completed: { quality: number; weak: number[] } | null;
   model: { wx: number[]; wy: number[]; residual: number } | null;
   sawMoving: boolean;
+  sawFollowing: boolean;
+  followRate: number;
 } {
   let target = { x: 0.5, y: 0.5 };
   const getTarget = () => target;
@@ -85,12 +87,14 @@ function runCalibration(
   let completed: { quality: number; weak: number[] } | null = null;
   let model: { wx: number[]; wy: number[]; residual: number } | null = null;
   let sawMoving = false;
+  let sawFollowing = false;
+  let movingTicks = 0, followTicks = 0;
 
   const ctrl = new CalibrationController(
     build(getTarget),
     fakeVideo,
     (p: CalibrationProgress) => {
-      if (p.movingPos) { target = p.movingPos; sawMoving = true; }
+      if (p.movingPos) { target = p.movingPos; sawMoving = true; movingTicks++; if (p.inRange) { sawFollowing = true; followTicks++; } }
       else if (p.point) { target = { x: p.point.x, y: p.point.y }; maxIndex = Math.max(maxIndex, p.index); }
     },
     (m, quality, weak) => { model = m; completed = { quality, weak }; },
@@ -99,7 +103,7 @@ function runCalibration(
   ctrl.start(opts.weak);
   drive(opts.ticks ?? 4500, 30, () => completed !== null);
   ctrl.stop();
-  return { maxIndex, completed, model, sawMoving };
+  return { maxIndex, completed, model, sawMoving, sawFollowing, followRate: movingTicks ? followTicks / movingTicks : 0 };
 }
 
 describe("CalibrationController", () => {
@@ -127,6 +131,41 @@ describe("CalibrationController", () => {
     const r = runCalibration((getTarget) => makeEngine({ getTarget, noFace: true }), { ticks: 4500 });
     expect(r.completed).not.toBeNull();
     expect(r.model!.wx.length).toBe(0);
+  });
+
+  it("sustains pursuit detection on a weak, noisy gaze signal", () => {
+    // Guards the low-signal path: a quarter-gain, noise-comparable signal (what a
+    // small screen viewed up close produces, since tracking it needs far less eye
+    // rotation) must still register pursuit at a sustained rate, not sporadically.
+    //
+    // NOTE: this does NOT reproduce the reported laptop-only freeze — the
+    // endpoint-only implementation this replaced also passes it. It pins down the
+    // behaviour we want; it is not evidence about that bug's cause.
+    let seed = 1;
+    const noise = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed / 0x7fffffff - 0.5) * 0.04; };
+    const r = runCalibration((getTarget) => {
+      const base = makeEngine({ getTarget });
+      return {
+        ...base,
+        estimate: (v, now) => {
+          const f = base.estimate(v, now);
+          if (!f.feature) return f;
+          // Quarter the gain of the cooperative stub, then add noise comparable
+          // to the remaining signal.
+          return { ...f, feature: {
+            ...f.feature,
+            ix: f.feature.ix * 0.25 + noise(),
+            iy: f.feature.iy * 0.25 + noise(),
+          } };
+        },
+      };
+    });
+    expect(r.sawMoving).toBe(true);
+    expect(r.completed).not.toBeNull();
+    // Rate, not merely "once": with endpoint-only correlation a noisy signal still
+    // trips `following` sporadically, so a boolean assertion passes either way and
+    // proves nothing. Sustained detection is what actually keeps collection alive.
+    expect(r.followRate).toBeGreaterThan(0.35);
   });
 
   it("calibrates only the requested weak points and skips the moving phase", () => {
