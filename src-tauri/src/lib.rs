@@ -974,6 +974,45 @@ extern "C" {
 /// Synthetic clicks (`mouse_click` etc.) silently no-op when this is false —
 /// this is the definitive check for "is the permission actually working", vs a
 /// stale toggle in System Settings.
+/// Keep the overlay pinned to whichever display it is currently on.
+///
+/// The window is framed to its monitor once at startup, but the answer changes:
+/// the user moves the app to the other screen, unplugs the external, or macOS
+/// rearranges displays. Any of those leaves the overlay the wrong size on the
+/// wrong screen — and since gaze is mapped across the DISPLAY rect, a stale frame
+/// misplaces every click, not just the visuals.
+///
+/// Polling is the pragmatic mechanism: there is no cross-platform display-change
+/// event in Tauri, and comparing a monitor rect a couple of times a second costs
+/// nothing. Emits `gaze:display-changed` so the UI can re-read `screen_info` and
+/// rescale the HUD and keyboard to the new panel.
+#[cfg(target_os = "macos")]
+fn spawn_display_watcher(app: tauri::AppHandle) {
+    use tauri::Emitter;
+    std::thread::spawn(move || {
+        let mut last: Option<(i32, i32, u32, u32)> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            let Some(win) = app.get_webview_window("main") else { continue };
+            let Ok(Some(mon)) = win.current_monitor() else { continue };
+            let p = *mon.position();
+            let s = *mon.size();
+            let now = (p.x, p.y, s.width, s.height);
+            if last == Some(now) { continue; }
+            let first = last.is_none();
+            last = Some(now);
+            // Re-frame to fill the new display, so normalized [0,1] keeps meaning
+            // "this screen's edges" (see `display_rect`).
+            let _ = win.set_position(tauri::PhysicalPosition::new(p.x, p.y));
+            let _ = win.set_size(tauri::PhysicalSize::new(s.width, s.height));
+            if !first {
+                println!("[gaze][display] changed -> {}x{} at ({},{})", s.width, s.height, p.x, p.y);
+                let _ = app.emit("gaze:display-changed", ());
+            }
+        }
+    });
+}
+
 /// Physical characteristics of the display the app is on, so the UI can size
 /// itself to the actual device instead of assuming one screen.
 ///
@@ -1135,14 +1174,10 @@ pub fn run() {
             // cursor could be warped there (mapping is display-relative) but the
             // reticle would stop short, so the two disagreed at the screen edges.
             // An explicit frame is used rather than maximize/zoom, which animate.
-            if let Some(win) = app.get_webview_window("main") {
-                if let Ok(Some(mon)) = win.current_monitor() {
-                    let p = *mon.position();
-                    let s = *mon.size();
-                    let _ = win.set_position(tauri::PhysicalPosition::new(p.x, p.y));
-                    let _ = win.set_size(tauri::PhysicalSize::new(s.width, s.height));
-                }
-            }
+            // The watcher below performs the initial framing and then keeps it
+            // correct as displays change.
+            #[cfg(target_os = "macos")]
+            spawn_display_watcher(app.handle().clone());
 
             // Auto-show the on-screen keyboard when a text field takes focus.
             #[cfg(target_os = "macos")]

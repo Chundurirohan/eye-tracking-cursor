@@ -73,8 +73,17 @@ function Inner() {
       root.style.setProperty("--dock-lift", `${Math.round(DOCK_LIFT_PT * scale)}px`);
     };
     void apply();
-    window.addEventListener("resize", apply); // display change / monitor swap
-    return () => { alive = false; window.removeEventListener("resize", apply); };
+    window.addEventListener("resize", apply);
+    // Rust watches which display the window is actually on and re-frames it when
+    // that changes (unplugged monitor, app dragged to the laptop panel, displays
+    // rearranged). `resize` alone misses those, leaving the HUD and keyboard
+    // sized for the previous screen.
+    const un = listen("gaze:display-changed", () => { void apply(); });
+    return () => {
+      alive = false;
+      window.removeEventListener("resize", apply);
+      void un.then((f) => f());
+    };
   }, []);
   // Radial action menu: the normalized gaze point where it's anchored, or null.
   const [actionMenu, setActionMenu] = useState<{ nx: number; ny: number } | null>(null);

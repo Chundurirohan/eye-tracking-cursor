@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "gaze"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "base64 0.22.1",
  "core-foundation 0.9.4",

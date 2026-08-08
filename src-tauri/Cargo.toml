@@ -1,6 +1,6 @@
 [package]
 name = "gaze"
-version = "3.1.0"
+version = "4.0.0"
 description = "Hands-free cursor control by eye tracking"
 authors = ["Rohan Chunduri"]
 edition = "2021"
