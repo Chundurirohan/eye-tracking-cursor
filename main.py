@@ -310,3 +310,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+try:
+    app.run()
+except KeyBoardInterruption
+    print("Keyboard interrupt received. Exiting...")
+    app.shutdown()
