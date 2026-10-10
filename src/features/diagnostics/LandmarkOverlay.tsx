@@ -1,14 +1,12 @@
 import { useEffect, useRef } from "react";
 import {
-  FilesetResolver, PoseLandmarker, FaceLandmarker, DrawingUtils,
+  PoseLandmarker, FaceLandmarker, DrawingUtils,
   type NormalizedLandmark,
 } from "@mediapipe/tasks-vision";
 import type { IGazeEngine } from "@/core/engine/IGazeEngine";
 
 // Bundle-local, like the gaze engine's assets — nothing is fetched at runtime.
 // See MediaPipeGazeEngine.init() for why the CDN paths were removed.
-const WASM = "/mediapipe/wasm";
-const POSE_MODEL = "/mediapipe/pose_landmarker.task";
 
 const FACE = "rgba(125,200,255,0.85)";
 const MESH = "rgba(125,200,255,0.22)";
@@ -34,7 +32,7 @@ export function LandmarkOverlay({
     if (!ctx) return;
     const drawer = new DrawingUtils(ctx);
 
-    let pose: PoseLandmarker | null = null;
+    let pose: PoseLandmarker | null = null as PoseLandmarker | null;
     let raf = 0;
     let disposed = false;
     let lastTs = -1;
@@ -67,16 +65,12 @@ export function LandmarkOverlay({
     };
 
     (async () => {
-      try {
-        const fileset = await FilesetResolver.forVisionTasks(WASM);
-        if (disposed) return;
-        pose = await PoseLandmarker.createFromOptions(fileset, {
-          baseOptions: { modelAssetPath: POSE_MODEL, delegate: "GPU" },
-          runningMode: "VIDEO", numPoses: 1,
-        });
-      } catch (err) {
-        console.warn("[gaze] pose model failed to load; showing face only:", err);
-      }
+      // The body-pose model is intentionally NOT loaded. A second MediaPipe task in
+      // the same page shares the vision wasm module with the gaze engine's
+      // FaceLandmarker and corrupts its heap ("Out of bounds memory access
+      // (_malloc)"), which silently killed all face detection once tracking began.
+      // The overlay shows the face mesh only; `pose` stays null.
+      if (disposed) return;
 
       const loop = () => {
         if (disposed) return;

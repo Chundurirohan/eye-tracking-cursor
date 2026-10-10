@@ -1,4 +1,4 @@
-// Bridge to the native macOS input layer (see src-tauri/src/lib.rs). Lets the
+// Bridge to the native input layer (macOS CoreGraphics / Linux XTest + portal) (see src-tauri/src/lib.rs). Lets the
 // gaze drive the REAL OS cursor and click into any app. All calls are guarded so
 // they no-op in a plain browser (npm run dev) where Tauri isn't present.
 
@@ -45,8 +45,35 @@ export function nativeScroll(dy: number): void {
   void invoke("mouse_scroll", { dy: Math.round(dy) }).catch(() => {});
 }
 
-/** Whether the app currently has effective macOS Accessibility permission.
- * Synthetic clicks silently no-op when this is false. */
+/** What the native layer can do on this OS/session (mirrors `Capabilities` in Rust). */
+export interface PlatformCaps {
+  os: "macos" | "linux" | "other" | "web";
+  session: string;
+  input_backend: string;
+  input: boolean;
+  magnet: boolean;
+  zoom: boolean;
+  text_focus: boolean;
+}
+
+const WEB_CAPS: PlatformCaps = { os: "web", session: "none", input_backend: "none", input: false, magnet: false, zoom: false, text_focus: false };
+
+/** Platform capabilities, so the UI can hide controls that cannot work here. */
+export async function platformInfo(): Promise<PlatformCaps> {
+  if (!inTauri) return WEB_CAPS;
+  try { return (await invoke("platform_info")) as PlatformCaps; } catch { return WEB_CAPS; }
+}
+
+/** Start the platform's input-permission flow (macOS Accessibility prompt; on
+ * Linux/Wayland, the RemoteDesktop portal consent). Resolves to the new state. */
+export async function requestAccess(): Promise<boolean> {
+  if (!inTauri) return false;
+  try { return (await invoke("request_accessibility")) as boolean; } catch { return false; }
+}
+
+/** Whether the app currently has effective permission to inject input (macOS
+ * Accessibility; on Linux, a ready input backend). Synthetic clicks silently
+ * no-op when this is false. */
 export async function isTrusted(): Promise<boolean> {
   if (!inTauri) return false;
   try { return (await invoke("is_trusted")) as boolean; } catch { return false; }
@@ -143,8 +170,10 @@ export function devLog(line: string): void {
   void invoke("dev_log", { line }).catch(() => {});
 }
 
-/** Tap a virtual key by macOS keycode (backspace 51, return 36, space 49, …). */
-export function keyTap(code: number): void {
+export type TapKey = "backspace" | "return" | "space";
+
+/** Tap a named key; the native layer maps it to the platform's keycode. */
+export function keyTap(key: TapKey): void {
   if (!inTauri) return;
-  void invoke("key_tap", { code }).catch(() => {});
+  void invoke("key_tap", { key }).catch(() => {});
 }

@@ -9,11 +9,12 @@ import { Capsule } from "@/features/tracking/Capsule";
 import { DwellCursor } from "@/features/tracking/DwellCursor";
 import { ReacquiringPill } from "@/features/tracking/ReacquiringPill";
 import { AdvancedView, type Diagnostics } from "@/features/diagnostics/AdvancedView";
+import { AccuracyTest } from "@/features/diagnostics/AccuracyTest";
 import { LandmarkOverlay } from "@/features/diagnostics/LandmarkOverlay";
 import { ConfidenceMeter } from "@/features/shared/ConfidenceMeter";
 import { Toggle } from "@/features/shared/Toggle";
 import { useHotkeys } from "@/features/shared/useHotkeys";
-import { setClickThrough, nativeClick, dispatchAction, isTrusted, zoomToggle, screenInfo, devLog } from "@/core/system/nativeInput";
+import { setClickThrough, nativeClick, dispatchAction, isTrusted, requestAccess, platformInfo, type PlatformCaps, zoomToggle, screenInfo, devLog } from "@/core/system/nativeInput";
 import { RadialMenu } from "@/features/tracking/RadialMenu";
 import { OnScreenKeyboard } from "@/features/tracking/OnScreenKeyboard";
 import { PoseAdaptiveCorrector } from "@/core/engine/adaptation";
@@ -49,6 +50,7 @@ function Inner() {
   const settings = useSettings();
   const [diag, setDiag] = useState<Diagnostics | null>(null);
   const [showDiag, setShowDiag] = useState(false);
+  const [showAccuracyTest, setShowAccuracyTest] = useState(false);
   const [calibNote, setCalibNote] = useState<string | null>(null);
   const [camLive, setCamLive] = useState(false);
   const [calibConf, setCalibConf] = useState<number | null>(null);
@@ -97,6 +99,16 @@ function Inner() {
   // Effective Accessibility permission (null = unknown yet). Synthetic clicks
   // no-op when false — this is the definitive shield-vs-permission diagnostic.
   const [axTrusted, setAxTrusted] = useState<boolean | null>(null);
+  // What this OS/session can do (null until the native layer answers).
+  const [caps, setCaps] = useState<PlatformCaps | null>(null);
+  useEffect(() => {
+    void platformInfo().then((c) => {
+      setCaps(c);
+      // Wayland: ask for screen-control consent up front (the compositor prompts once,
+      // then remembers) so it's ready by the time calibration finishes.
+      if (c.input_backend === "portal") void requestAccess();
+    });
+  }, []);
   // A "Ready to calibrate" gate the user must press before calibration starts.
   const [calibReady, setCalibReady] = useState(false);
   const calibAttemptsRef = useRef(0);
@@ -399,14 +411,24 @@ function Inner() {
       {isWidget && showKeyboard && (
         <OnScreenKeyboard onClose={() => { keyboardAutoRef.current = false; setShowKeyboard(false); }} />
       )}
-      {isWidget && axTrusted !== null && (
-        <div style={{ position: "fixed", top: 8, left: "50%", transform: "translateX(-50%)",
-          zIndex: 70, pointerEvents: "none", fontSize: 11, fontWeight: 600,
-          padding: "3px 12px", borderRadius: 999, color: "#fff", backdropFilter: "blur(8px)",
-          background: axTrusted ? "rgba(16,120,60,0.85)" : "rgba(160,32,32,0.92)" }}>
-          {axTrusted ? "Accessibility ✓ — clicks can land" : "Accessibility ✗ — clicks will NOT land"}
-        </div>
-      )}
+      {isWidget && axTrusted !== null && (() => {
+        const linux = caps?.os === "linux";
+        const ok = axTrusted;
+        const label = linux
+          ? (ok ? `Input ✓ — ${caps?.input_backend} — clicks can land` : "Input ✗ — look here to grant access")
+          : (ok ? "Accessibility ✓ — clicks can land" : "Accessibility ✗ — clicks will NOT land");
+        const grant = linux && !ok;
+        return (
+          <div data-dwell={grant ? true : undefined}
+            onClick={grant ? () => { void requestAccess(); } : undefined}
+            style={{ position: "fixed", top: 8, left: "50%", transform: "translateX(-50%)",
+              zIndex: 70, pointerEvents: grant ? "auto" : "none", fontSize: 11, fontWeight: 600,
+              padding: "3px 12px", borderRadius: 999, color: "#fff", backdropFilter: "blur(8px)",
+              background: ok ? "rgba(16,120,60,0.85)" : "rgba(160,32,32,0.92)" }}>
+            {label}
+          </div>
+        );
+      })()}
       {reanchoring && (
         <div style={{ position: "fixed", inset: 0, zIndex: 80, pointerEvents: "none",
           display: "grid", placeItems: "center", gap: 14 }}>
@@ -483,6 +505,7 @@ function Inner() {
 
       {state === "reacquiring" && <ReacquiringPill />}
       {showDiag && diag && <AdvancedView d={diag} onClose={() => setShowDiag(false)} />}
+      {showAccuracyTest && <AccuracyTest onClose={() => setShowAccuracyTest(false)} />}
 
       {showCapsule && (
         <Capsule
@@ -494,15 +517,25 @@ function Inner() {
           keyboardOn={showKeyboard}
           onToggleKeyboard={() => { keyboardAutoRef.current = false; setShowKeyboard((v) => !v); }}
           zoomOn={zoomOn}
-          onToggleZoom={() => { zoomToggle(); setZoomOn((v) => !v); }}
-          settingsSlot={<SettingsPanel onToggleDiagnostics={() => setShowDiag((s) => !s)} showDiag={showDiag} />}
+          onToggleZoom={caps?.zoom ? () => { zoomToggle(); setZoomOn((v) => !v); } : undefined}
+          settingsSlot={
+            <SettingsPanel
+              onToggleDiagnostics={() => setShowDiag((s) => !s)}
+              showDiag={showDiag}
+              onRunAccuracyTest={() => setShowAccuracyTest(true)}
+            />
+          }
         />
       )}
     </div>
   );
 }
 
-function SettingsPanel({ onToggleDiagnostics, showDiag }: { onToggleDiagnostics: () => void; showDiag: boolean }) {
+function SettingsPanel({ onToggleDiagnostics, showDiag, onRunAccuracyTest }: {
+  onToggleDiagnostics: () => void;
+  showDiag: boolean;
+  onRunAccuracyTest: () => void;
+}) {
   const s = useSettings();
   return (
     <div>
@@ -522,6 +555,11 @@ function SettingsPanel({ onToggleDiagnostics, showDiag }: { onToggleDiagnostics:
         </div>
       </div>
       <div style={{ borderTop: "1px solid var(--stroke)", marginTop: 6, paddingTop: 6 }}>
+        <button data-dwell onClick={onRunAccuracyTest}
+          style={{ width: "100%", padding: "9px 0", marginBottom: 6, borderRadius: "var(--radius-md)",
+            background: "var(--accent-soft)", color: "var(--accent)", fontSize: 13.5, fontWeight: 600 }}>
+          Run browser accuracy test
+        </button>
         <Toggle label="Advanced diagnostics" checked={showDiag} onChange={onToggleDiagnostics} />
       </div>
     </div>

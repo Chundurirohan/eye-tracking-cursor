@@ -23,7 +23,7 @@ export function Capsule({ state, side, armed = true, onPauseToggle, onRecalibrat
   onToggleKeyboard?: () => void;
   /** macOS Zoom magnifier toggle (dwell-clickable). */
   zoomOn?: boolean;
-  onToggleZoom?: () => void;
+  onToggleZoom?: (() => void) | undefined;
 }) {
   const [open, setOpen] = useState(false);
   const paused = state === "paused";

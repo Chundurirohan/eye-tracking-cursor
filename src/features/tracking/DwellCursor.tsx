@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { confidenceLook } from "@/features/shared/confidenceColor";
 import { warpCursor, nativeTargets, nativeScroll } from "@/core/system/nativeInput";
+import { logPixelError } from "@/core/system/pixelError";
 
 const DWELL_MS = 800;       // hold gaze on a registered clickable this long to act
 const FREE_DWELL_MS = 1500; // longer, deliberate dwell where NO clickable is detected
@@ -289,6 +290,7 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
         setDisp(null); setProgress(0); progressRef.current = 0; setRect(null);
         dispSmoothRef.current = null; return;
       }
+      const diagnosticMode = document.body.dataset.accuracyTest === "true";
       const px = p.x * window.innerWidth, py = p.y * window.innerHeight;
 
       // Expire magnet-fatigue suppression on a timer so it can never deadlock the
@@ -318,14 +320,16 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
       const conf = clamp01(confRef.current ?? 0);
       const radiusN = SNAP_FRAC * (1 + CONF_RADIUS_GAIN * (1 - conf)); // normalized snap radius
       const radiusPx = radiusN * Math.min(window.innerWidth, window.innerHeight);
-      let target = nearestClickable(px, py, radiusPx * HUD_SNAP_STRENGTH, vx, vy, suppressRef.current);
+      let target = diagnosticMode
+        ? null
+        : nearestClickable(px, py, radiusPx * HUD_SNAP_STRENGTH, vx, vy, suppressRef.current);
 
       // Sticky commit: once a dwell has begun, keep the SAME target even if gaze
       // jitter makes a neighbor momentarily nearest — only release when the gaze
       // clearly leaves the committed target's bounds. Stops the "dwell keeps
       // resetting between two adjacent buttons" problem.
       const sticky = targetRef.current;
-      if (sticky && sticky !== target && progressRef.current > 0.12 && document.contains(sticky)) {
+      if (!diagnosticMode && sticky && sticky !== target && progressRef.current > 0.12 && document.contains(sticky)) {
         const r = sticky.getBoundingClientRect();
         if (r.width > 0) {
           const dx = Math.max(r.left - px, 0, px - r.right);
@@ -339,7 +343,7 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
       // targets and their boxes appear the moment you look, just like the HUD.
       // Locked once a dwell has committed so gaze noise can't switch the target.
       let nativeSnap: P | null = null;
-      if (armed && !target) {
+      if (armed && !target && !diagnosticMode) {
         // Sticky commit for system-wide targets too: keep the current hit while a
         // dwell is underway and the gaze is still within its bounds + margin.
         const cur = nativeHitRef.current;
@@ -428,7 +432,7 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
       // engages once a dwell has already FIRED at this spot (`armedPosRef` set and
       // not yet cleared by moving away) — so a fresh look always gets the timer,
       // and only a continued hold after acting starts scrolling.
-      if (armed && !target && !nativeSnap && (inTop || inBottom) && armedPosRef.current) {
+      if (armed && !diagnosticMode && !target && !nativeSnap && (inTop || inBottom) && armedPosRef.current) {
         if (!scrollDwellRef.current) scrollDwellRef.current = now;
         setRect(null); setProgress(0); progressRef.current = 0; targetRef.current = null; freeAnchorRef.current = null;
         if (now - scrollDwellRef.current > SCROLL_DELAY && now - lastScrollRef.current > SCROLL_TICK_MS) {
@@ -455,12 +459,18 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
         const settleMs = Number(target.dataset.dwellSettle) || 0;
         const prog = Math.min(1, Math.max(0, now - dwellStartRef.current - settleMs) / dwellMs);
         setProgress(prog); progressRef.current = prog;
+        if (target.dataset.accuracyTest) {
+          window.dispatchEvent(new CustomEvent("gaze:dwell-progress", { detail: { progress: prog } }));
+        }
         if (prog >= 1 && canClick) {
+          window.dispatchEvent(new CustomEvent("gaze:dwell-complete", { detail: { point: p, display: sm, control: target.dataset.testControl === "true" } }));
+          if (!target.dataset.accuracyTest) logPixelError(sm);
           target.click(); armedElRef.current = target; armedPosRef.current = null;
           if (armed) calibrateRef.current?.(p, dispN); // dispN = DOM target center
           fire(now, r.left + r.width / 2, r.top + r.height / 2);
         }
       } else {
+        window.dispatchEvent(new CustomEvent("gaze:dwell-progress", { detail: { progress: 0 } }));
         targetRef.current = null;
         // Highlight box for a system-wide clickable (other app), identical to the
         // box drawn on our own HUD controls — so "on something clickable → box,
@@ -488,11 +498,18 @@ export function DwellCursor({ active, armed, confidence, onNativeClick, onCalibr
         const dwellNeeded = nativeSnap ? DWELL_MS : FREE_DWELL_MS;
         const prog = Math.min(1, (now - dwellStartRef.current) / dwellNeeded);
         setProgress(prog); progressRef.current = prog;
+        window.dispatchEvent(new CustomEvent("gaze:dwell-progress", { detail: { progress: prog } }));
         if (prog >= 1 && canClick && !menuOpenRef.current) {
+          window.dispatchEvent(new CustomEvent("gaze:dwell-complete", { detail: { point: p, display: sm } }));
+          if (document.body.dataset.accuracyTest === "true") {
+            fire(now, aim.x * window.innerWidth, aim.y * window.innerHeight);
+            return;
+          }
           // Open the radial action menu at the aim point; the chosen petal
           // dispatches the actual click type. (Direct left-click still available
           // via the "Click" petal — kept as one glance.)
           requestMenuRef.current?.(aim.x, aim.y);
+          logPixelError(sm);
           // Automatic drift-learning: only from a SMALL detected target, where
           // the gaze was genuinely on it, so (center − gaze) is a clean sample.
           const nr = nativeHitRef.current;

@@ -7,7 +7,6 @@ import { suggest } from "./predict";
 // overlay is click-through and never steals focus). Letters type via a Unicode
 // string; Backspace / Return / Space use virtual keycodes.
 
-const KEY_DELETE = 51, KEY_RETURN = 36, KEY_SPACE = 49;
 // Keys need DELIBERATE dwell so a glance doesn't type gibberish. A "settle gate"
 // (data-dwell-settle) means the fill only begins after your gaze has rested on a
 // key briefly — so keys you merely pass OVER on the way never fire. Together with
@@ -118,14 +117,14 @@ export function OnScreenKeyboard({ onClose, onKeyFeedback }: {
               <Key key={ch} onClick={() => typeChar(ch)}>{shift && !symbols ? ch.toUpperCase() : ch}</Key>
             ))}
             {ri === rows.length - 1 && (
-              <Key wide onClick={() => press(() => { keyTap(KEY_DELETE); setWord(wordRef.current.slice(0, -1)); setTyped((t) => t.slice(0, -1)); })}>⌫</Key>
+              <Key wide onClick={() => press(() => { keyTap("backspace"); setWord(wordRef.current.slice(0, -1)); setTyped((t) => t.slice(0, -1)); })}>⌫</Key>
             )}
           </div>
         ))}
         <div style={{ display: "flex", justifyContent: "center", gap: 16 }}>
           <Key wide onClick={() => press(() => setSymbols((v) => !v))} active={symbols}>{symbols ? "ABC" : "123"}</Key>
-          <Key grow onClick={() => press(() => { keyTap(KEY_SPACE); setWord(""); setTyped((t) => t + " "); })}>space</Key>
-          <Key wide onClick={() => press(() => { keyTap(KEY_RETURN); setWord(""); setTyped(""); })}>⏎</Key>
+          <Key grow onClick={() => press(() => { keyTap("space"); setWord(""); setTyped((t) => t + " "); })}>space</Key>
+          <Key wide onClick={() => press(() => { keyTap("return"); setWord(""); setTyped(""); })}>⏎</Key>
           <Key wide onClick={onClose}>✕</Key>
         </div>
       </div>

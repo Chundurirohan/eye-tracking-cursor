@@ -1,3 +1,4 @@
+import { devLog } from "@/core/system/nativeInput";
 import {
   FaceLandmarker, FilesetResolver, type FaceLandmarkerResult,
 } from "@mediapipe/tasks-vision";
@@ -47,17 +48,46 @@ export class MediaPipeGazeEngine implements IGazeEngine {
     // a CDN compromise could execute code with cursor and keyboard control of the
     // user's machine. Loading from the bundle removes that path entirely and is
     // what the strict CSP in tauri.conf.json now enforces.
-    const fileset = await FilesetResolver.forVisionTasks("/mediapipe/wasm");
-    this.landmarker = await FaceLandmarker.createFromOptions(fileset, {
-      baseOptions: {
-        modelAssetPath: "/mediapipe/face_landmarker.task",
-        delegate: "GPU",
-      },
-      runningMode: "VIDEO",
-      numFaces: 1,
-      outputFaceBlendshapes: false,
-      outputFacialTransformationMatrixes: true,
-    });
+    const make = async (delegate: "GPU" | "CPU") => {
+      // A fresh fileset per attempt: a failed GPU start can leave the wasm module unusable.
+      const fileset = await FilesetResolver.forVisionTasks("/mediapipe/wasm");
+      // WebKitGTK can't make a WebGL context on MediaPipe's default OffscreenCanvas
+      // (the "kGpuService" / GLctx errors), but does on a real, in-DOM-less canvas.
+      const canvas = document.createElement("canvas");
+      canvas.width = 640; canvas.height = 480;
+      let glOk = false;
+      try { glOk = !!(canvas.getContext("webgl2") ?? canvas.getContext("webgl")); } catch { /* none */ }
+      devLog(`WebGL on a regular canvas: ${glOk ? "available" : "NOT available"}`);
+      return FaceLandmarker.createFromOptions(fileset, {
+        canvas,
+        baseOptions: { modelAssetPath: "/mediapipe/face_landmarker.task", delegate },
+        runningMode: "VIDEO",
+        numFaces: 1,
+        outputFaceBlendshapes: false,
+        outputFacialTransformationMatrixes: true,
+      });
+    };
+    try {
+      this.landmarker = await make("GPU");
+    } catch (err) {
+      // No WebGL context (common in WebKitGTK / Linux VMs / blocklisted GPUs): run on CPU.
+      console.warn("[gaze] GPU delegate unavailable, falling back to CPU:", err);
+      devLog("MediaPipe: GPU delegate unavailable, using CPU");
+      this.landmarker = await make("CPU");
+    }
+  }
+
+  private diagAt = 0; private diagN = 0; private diagFaces = 0; private diagMs = 0; private diagErr = "";
+  /** Once every 3s, print detection stats to the terminal (webview console isn't reachable). */
+  private diag(t0: number, face: boolean, err?: unknown): void {
+    const t = performance.now();
+    this.diagN++; this.diagMs += t - t0; if (face) this.diagFaces++;
+    if (err && !this.diagErr) this.diagErr = err instanceof Error ? err.message : String(err);
+    if (t - this.diagAt < 3000) return;
+    if (this.diagN > 1) {
+      devLog(`detect: ${this.diagN} frames, ${this.diagFaces} with face, avg ${(this.diagMs / this.diagN).toFixed(0)}ms${this.diagErr ? `, error: ${this.diagErr}` : ""}`);
+    }
+    this.diagAt = t; this.diagN = 0; this.diagFaces = 0; this.diagMs = 0; this.diagErr = "";
   }
 
   setCalibration(model: CalibrationModel | null): void { this.calibration = model; }
@@ -67,11 +97,14 @@ export class MediaPipeGazeEngine implements IGazeEngine {
     if (!this.landmarker || video.readyState < 2) return this.empty(now, "no_face");
 
     let result: FaceLandmarkerResult;
+    const t0 = performance.now();
     try {
       result = this.landmarker.detectForVideo(video, now);
-    } catch {
+    } catch (err) {
+      this.diag(t0, false, err);
       return this.empty(now, "no_face");
     }
+    this.diag(t0, !!result.faceLandmarks?.length);
     if (!result.faceLandmarks?.length) return this.empty(now, "no_face");
 
     const lm = result.faceLandmarks[0]!;
