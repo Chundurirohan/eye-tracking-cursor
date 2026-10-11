@@ -1,0 +1,26 @@
+{
+  "bundle": {
+    "targets": ["deb", "rpm", "appimage"],
+    "category": "Utility",
+    "linux": {
+      "deb": {
+        "section": "utils",
+        "depends": [
+          "gstreamer1.0-plugins-good",
+          "gstreamer1.0-pipewire",
+          "xdg-desktop-portal"
+        ]
+      },
+      "rpm": {
+        "depends": [
+          "gstreamer1-plugins-good",
+          "pipewire-gstreamer",
+          "xdg-desktop-portal"
+        ]
+      },
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    }
+  }
+}

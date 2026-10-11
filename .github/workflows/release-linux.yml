@@ -1,0 +1,37 @@
+name: linux-release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  check-macos:
+    # Gate: the platform refactor must not break the macOS build.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --manifest-path src-tauri/Cargo.toml
+
+  build-linux:
+    # Oldest supported LTS so the deb/AppImage run against an older glibc.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libxdo-dev libssl-dev flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+      - run: npm ci
+      - run: npm test
+      - run: ./scripts/release-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gaze-linux
+          path: dist-linux/*.*

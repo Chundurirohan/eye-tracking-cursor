@@ -1,0 +1,4 @@
+,runs,points,mean_px,median_px,sd_px,p90_px,rmse_px,within_100px_%,within_200px_%
+Earlier build (Oct 3),3.0,35.0,142.6,115.4,117.0,272.4,183.4,40.0,71.4
+Linux build (Oct 10),4.0,48.0,180.3,128.6,149.6,337.1,233.3,29.2,68.8
+All valid,7.0,83.0,164.4,124.2,137.3,285.4,213.7,33.7,69.9
